@@ -16,8 +16,7 @@ GOOGLE_ELEVATION_API_KEY = os.getenv("GOOGLE_ELEVATION_API_KEY")
 KAKAO_DIRECTIONS_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 GOOGLE_ELEVATION_URL = "https://maps.googleapis.com/maps/api/elevation/json"
 
-TOLERANCE = 0.3
-RANDOM_SAMPLES = 20
+RANDOM_SAMPLES = 30
 MAX_CANDIDATES = 3
 ELEV_SAMPLE_POINTS = 10
 
@@ -68,12 +67,16 @@ def generate_random_destinations(lat, lon, target_km):
 
 
 def get_route(start, dest):
+    if not KAKAO_REST_API_KEY:
+        return {}
+
     headers = {"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"}
     params = {
         "origin": f"{start[1]},{start[0]}",
         "destination": f"{dest[1]},{dest[0]}",
         "priority": "RECOMMEND"
     }
+
     try:
         res = requests.get(
             KAKAO_DIRECTIONS_URL,
@@ -81,6 +84,8 @@ def get_route(start, dest):
             params=params,
             timeout=10
         )
+        if res.status_code != 200:
+            return {}
         return res.json()
     except Exception:
         return {}
@@ -101,15 +106,31 @@ def extract_polyline(route):
         for r in roads:
             v = r.get("vertexes", [])
             for i in range(0, len(v), 2):
-                points.append((v[i + 1], v[i]))
+                points.append((v[i + 1], v[i]))  # (lat, lng)
     except Exception:
         return []
 
     return points
 
 
-def get_elevations(points):
+def sample_points(points, n=ELEV_SAMPLE_POINTS):
     if not points:
+        return []
+
+    if len(points) <= n:
+        return points
+
+    sampled = []
+    last_index = len(points) - 1
+    for i in range(n):
+        idx = round(i * last_index / (n - 1))
+        sampled.append(points[idx])
+
+    return sampled
+
+
+def get_elevations(points):
+    if not points or not GOOGLE_ELEVATION_API_KEY:
         return []
 
     locs = "|".join([f"{lat},{lon}" for lat, lon in points])
@@ -125,8 +146,15 @@ def get_elevations(points):
 
 
 def analyze(points, elev):
-    ascent = 0
-    max_grade = 0
+    if len(points) < 2 or len(elev) < 2 or len(points) != len(elev):
+        return {
+            "total_ascent_m": 0.0,
+            "max_grade_percent": 0.0,
+            "difficulty_score": 0.0
+        }
+
+    ascent = 0.0
+    max_grade = 0.0
 
     for i in range(len(points) - 1):
         d = haversine(points[i], points[i + 1])
@@ -154,6 +182,19 @@ def convert_score(difficulty_score):
     return round(score / 100.0, 2)
 
 
+def classify_congestion(distance_km):
+    # 임시 규칙 기반
+    if distance_km < 2.5:
+        return "낮음"
+    if distance_km < 4.5:
+        return "중간"
+    return "높음"
+
+
+def route_points_objects(polyline):
+    return [{"lat": lat, "lng": lng} for lat, lng in polyline]
+
+
 @app.get("/")
 def root():
     return {"message": "server is running"}
@@ -170,6 +211,7 @@ def recommend(request: FitnessRecommendRequest):
     max_d = target_m * 1.3
 
     routes_result = []
+    seen_signatures = set()
 
     for dlat, dlon in generate_random_destinations(lat, lon, target_km):
         route = get_route((lat, lon), (dlat, dlon))
@@ -192,18 +234,43 @@ def recommend(request: FitnessRecommendRequest):
         if len(poly) < 5:
             continue
 
+        # 중복 비슷한 경로 제거용 간단 서명
+        signature = (
+            round(poly[-1][0], 3),
+            round(poly[-1][1], 3),
+            round(dist / 100)
+        )
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+
+        elev_points = sample_points(poly, ELEV_SAMPLE_POINTS)
+        elev_values = get_elevations(elev_points)
+        analysis = analyze(elev_points, elev_values)
+
+        elevation_gain = int(round(analysis["total_ascent_m"]))
+        score = convert_score(analysis["difficulty_score"])
+        congestion_text = classify_congestion(dist / 1000)
+
         routes_result.append({
             "route_id": f"r{len(routes_result) + 1}",
             "title": f"추천 코스 {len(routes_result) + 1}",
             "distance_km": round(dist / 1000, 1),
             "duration_min": int(duration_sec / 60),
-            "elevation_gain": 50,
-            "congestion_text": "중간",
-            "score": round(random.uniform(0.7, 0.95), 2),
-            "polyline": [[p_lat, p_lng] for p_lat, p_lng in poly]
+            "elevation_gain": elevation_gain,
+            "congestion_text": congestion_text,
+            "score": score,
+
+            # 앱 매핑 편하게 둘 다 제공
+            "route_points": route_points_objects(poly),
+            "polyline": [[p_lat, p_lng] for p_lat, p_lng in poly],
+
+            # 디버깅/확인용
+            "max_grade_percent": analysis["max_grade_percent"],
+            "difficulty_score": analysis["difficulty_score"]
         })
 
-        if len(routes_result) >= 3:
+        if len(routes_result) >= MAX_CANDIDATES:
             break
 
     return {"routes": routes_result}
