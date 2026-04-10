@@ -16,9 +16,9 @@ GOOGLE_ELEVATION_API_KEY = os.getenv("GOOGLE_ELEVATION_API_KEY")
 KAKAO_DIRECTIONS_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 GOOGLE_ELEVATION_URL = "https://maps.googleapis.com/maps/api/elevation/json"
 
-RANDOM_SAMPLES = 40
+RANDOM_SAMPLES = 12
 MAX_CANDIDATES = 3
-ELEV_SAMPLE_POINTS = 10
+ELEV_SAMPLE_POINTS = 5
 
 
 class FitnessRecommendRequest(BaseModel):
@@ -64,14 +64,13 @@ def destination_point(lat, lon, bearing_deg, distance_km):
     return math.degrees(lat2), math.degrees(lon2)
 
 
-def generate_random_destinations(lat, lon, target_km):
+def generate_random_destinations(lat, lon, target_km, sample_count=RANDOM_SAMPLES):
     destinations = []
 
-    # 너무 짧거나 너무 길지 않게 범위 조절
     min_km = max(1.0, target_km * 0.75)
     max_km = max(min_km + 0.5, target_km * 1.25)
 
-    for _ in range(RANDOM_SAMPLES):
+    for _ in range(sample_count):
         bearing = random.uniform(0, 360)
         distance_km = random.uniform(min_km, max_km)
         destinations.append(destination_point(lat, lon, bearing, distance_km))
@@ -98,7 +97,7 @@ def get_route(start, dest):
             KAKAO_DIRECTIONS_URL,
             headers=headers,
             params=params,
-            timeout=10
+            timeout=4
         )
         if response.status_code != 200:
             return {}
@@ -139,6 +138,9 @@ def sample_points(points, n=ELEV_SAMPLE_POINTS):
     if len(points) <= n:
         return points
 
+    if n <= 1:
+        return [points[0]]
+
     sampled = []
     last_index = len(points) - 1
 
@@ -160,7 +162,7 @@ def get_elevations(points):
     }
 
     try:
-        response = requests.get(GOOGLE_ELEVATION_URL, params=params, timeout=10)
+        response = requests.get(GOOGLE_ELEVATION_URL, params=params, timeout=4)
         data = response.json()
 
         if data.get("status") != "OK":
@@ -205,11 +207,9 @@ def analyze_route(points, elevations):
 
 
 def convert_score(distance_km, target_km, difficulty_score):
-    # 목표 거리와 가까울수록 가산점
     distance_gap = abs(distance_km - target_km)
     distance_penalty = min(25.0, distance_gap * 12.0)
 
-    # 난이도 점수 페널티
     difficulty_penalty = min(60.0, difficulty_score * 0.6)
 
     raw = 100.0 - distance_penalty - difficulty_penalty
@@ -219,8 +219,6 @@ def convert_score(distance_km, target_km, difficulty_score):
 
 
 def classify_congestion(distance_km, ascent_m):
-    # 아직 실제 교통 혼잡도가 없으니 임시 분류
-    # 거리 + 상승고도 기준으로만 단순 구분
     score = distance_km * 0.7 + (ascent_m / 100.0) * 0.3
 
     if score < 3.0:
@@ -247,6 +245,97 @@ def build_signature(polyline, distance_km):
     )
 
 
+def build_candidate(route_json, target_km, seen_signatures, index):
+    routes = route_json.get("routes", [])
+    if not routes:
+        return None
+
+    summary = routes[0].get("summary", {})
+    distance_m = summary.get("distance", 0)
+    duration_sec = summary.get("duration", 0)
+
+    distance_km = round(distance_m / 1000.0, 1)
+    polyline = extract_polyline(route_json)
+
+    if len(polyline) < 5:
+        return None
+
+    signature = build_signature(polyline, distance_km)
+    if signature in seen_signatures:
+        return None
+
+    seen_signatures.add(signature)
+
+    analysis = {
+        "total_ascent_m": 0.0,
+        "max_grade_percent": 0.0,
+        "difficulty_score": 0.0
+    }
+
+    try:
+        elev_points = sample_points(polyline, ELEV_SAMPLE_POINTS)
+        elevations = get_elevations(elev_points)
+
+        if len(elev_points) >= 2 and len(elevations) == len(elev_points):
+            analysis = analyze_route(elev_points, elevations)
+    except Exception:
+        pass
+
+    elevation_gain = int(round(analysis["total_ascent_m"]))
+    congestion_text = classify_congestion(distance_km, elevation_gain)
+    score = convert_score(
+        distance_km=distance_km,
+        target_km=target_km,
+        difficulty_score=analysis["difficulty_score"]
+    )
+
+    return {
+        "route_id": f"r{index}",
+        "title": f"추천 코스 {index}",
+        "distance_km": distance_km,
+        "duration_min": max(1, int(round(duration_sec / 60))),
+        "elevation_gain": elevation_gain,
+        "congestion_text": congestion_text,
+        "score": score,
+        "route_points": route_points_objects(polyline),
+        "polyline": [[lat, lng] for lat, lng in polyline],
+        "max_grade_percent": analysis["max_grade_percent"],
+        "difficulty_score": analysis["difficulty_score"]
+    }
+
+
+def collect_candidates(start, target_km, min_dist_km, max_dist_km, candidates, seen_signatures):
+    destinations = generate_random_destinations(start[0], start[1], target_km)
+
+    for dest in destinations:
+        route_json = get_route(start, dest)
+        routes = route_json.get("routes", [])
+        if not routes:
+            continue
+
+        summary = routes[0].get("summary", {})
+        distance_m = summary.get("distance", 0)
+        distance_km = round(distance_m / 1000.0, 1)
+
+        if not (min_dist_km <= distance_km <= max_dist_km):
+            continue
+
+        candidate = build_candidate(
+            route_json=route_json,
+            target_km=target_km,
+            seen_signatures=seen_signatures,
+            index=len(candidates) + 1
+        )
+
+        if candidate is None:
+            continue
+
+        candidates.append(candidate)
+
+        if len(candidates) >= MAX_CANDIDATES:
+            break
+
+
 @app.get("/")
 def root():
     return {"message": "server is running"}
@@ -257,69 +346,31 @@ def recommend_loop(request: FitnessRecommendRequest):
     start = (request.start_lat, request.start_lng)
     target_km = request.target_km
 
-    min_dist_km = max(1.0, target_km * 0.7)
-    max_dist_km = target_km * 1.3
-
     candidates = []
     seen_signatures = set()
 
-    destinations = generate_random_destinations(
-        request.start_lat,
-        request.start_lng,
-        target_km
+    # 1차: 기본 조건
+    collect_candidates(
+        start=start,
+        target_km=target_km,
+        min_dist_km=max(1.0, target_km * 0.7),
+        max_dist_km=target_km * 1.3,
+        candidates=candidates,
+        seen_signatures=seen_signatures
     )
 
-    for dest in destinations:
-        route_json = get_route(start, dest)
-        routes = route_json.get("routes", [])
-        if not routes:
-            continue
-
-        summary = routes[0].get("summary", {})
-        distance_m = summary.get("distance", 0)
-        duration_sec = summary.get("duration", 0)
-
-        distance_km = round(distance_m / 1000.0, 1)
-
-        if not (min_dist_km <= distance_km <= max_dist_km):
-            continue
-
-        polyline = extract_polyline(route_json)
-        if len(polyline) < 5:
-            continue
-
-        signature = build_signature(polyline, distance_km)
-        if signature in seen_signatures:
-            continue
-        seen_signatures.add(signature)
-
-        elev_points = sample_points(polyline, ELEV_SAMPLE_POINTS)
-        elevations = get_elevations(elev_points)
-        analysis = analyze_route(elev_points, elevations)
-
-        elevation_gain = int(round(analysis["total_ascent_m"]))
-        congestion_text = classify_congestion(distance_km, elevation_gain)
-        score = convert_score(
-            distance_km=distance_km,
+    # 2차: 후보 부족하면 조건 완화
+    if len(candidates) < MAX_CANDIDATES:
+        collect_candidates(
+            start=start,
             target_km=target_km,
-            difficulty_score=analysis["difficulty_score"]
+            min_dist_km=max(1.0, target_km * 0.55),
+            max_dist_km=target_km * 1.45,
+            candidates=candidates,
+            seen_signatures=seen_signatures
         )
 
-        candidates.append({
-            "route_id": f"r{len(candidates) + 1}",
-            "title": f"추천 코스 {len(candidates) + 1}",
-            "distance_km": distance_km,
-            "duration_min": max(1, int(round(duration_sec / 60))),
-            "elevation_gain": elevation_gain,
-            "congestion_text": congestion_text,
-            "score": score,
-            "route_points": route_points_objects(polyline),
-            "polyline": [[lat, lng] for lat, lng in polyline],
-            "max_grade_percent": analysis["max_grade_percent"],
-            "difficulty_score": analysis["difficulty_score"]
-        })
-
-    # 점수 높은 순, 목표 거리와 가까운 순으로 정렬
+    # 점수 높은 순, 목표 거리와 가까운 순, 고도 낮은 순
     candidates.sort(
         key=lambda x: (
             -x["score"],
@@ -328,7 +379,9 @@ def recommend_loop(request: FitnessRecommendRequest):
         )
     )
 
-    # 3개만 반환
     routes_result = candidates[:MAX_CANDIDATES]
 
-    return {"routes": routes_result}
+    return {
+        "routes": routes_result,
+        "count": len(routes_result)
+    }
