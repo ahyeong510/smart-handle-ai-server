@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from typing import List
 import requests
 import math
 import os
@@ -21,11 +22,20 @@ MAX_CANDIDATES = 3
 ELEV_SAMPLE_POINTS = 10
 
 
+class RideHistoryItem(BaseModel):
+    elevationGain: int
+    turnCount: int
+    durationMin: int
+    completionPercent: int
+    satisfaction: str
+
+
 class FitnessRecommendRequest(BaseModel):
     user_id: str
     start_lat: float
     start_lng: float
     target_km: float
+    ride_history: List[RideHistoryItem] = []
 
 
 # ------------------ 기본 유틸 ------------------
@@ -59,12 +69,80 @@ def normalize_low_better(value, min_value, max_value):
     return 1.0 - ((value - min_value) / (max_value - min_value))
 
 
+def clamp(value, min_value=0.0, max_value=1.0):
+    return max(min_value, min(max_value, value))
+
+
 def get_default_user_weights():
     return {
         "elevation": 0.4,
         "turn": 0.3,
         "duration": 0.3
     }
+
+
+# ------------------ 사용자 맞춤 추천 ------------------
+
+def satisfaction_to_score(satisfaction: str) -> float:
+    if satisfaction == "만족":
+        return 1.0
+    elif satisfaction == "보통":
+        return 0.6
+    elif satisfaction == "불만족":
+        return 0.2
+    return 0.5
+
+
+def compute_feedback_score(completion_percent: int, satisfaction: str) -> float:
+    completion_score = clamp(completion_percent / 100.0)
+    satisfaction_score = satisfaction_to_score(satisfaction)
+    return 0.6 * completion_score + 0.4 * satisfaction_score
+
+
+def get_user_preference_from_history(rides: List[dict]):
+    if not rides:
+        return get_default_user_weights()
+
+    scored_rides = []
+    for ride in rides:
+        feedback = compute_feedback_score(
+            ride.get("completionPercent", 0),
+            ride.get("satisfaction", "")
+        )
+        scored_rides.append({
+            "feedback": feedback,
+            "elevation": ride.get("elevationGain", 0),
+            "turn": ride.get("turnCount", 0),
+            "duration": ride.get("durationMin", 0)
+        })
+
+    # 최근 기록 중 반응이 좋은 것 위주
+    good_rides = [r for r in scored_rides if r["feedback"] >= 0.7]
+
+    if not good_rides:
+        good_rides = scored_rides
+
+    # 반응이 좋았던 기록의 평균 특성
+    avg_elev = sum(r["elevation"] for r in good_rides) / len(good_rides)
+    avg_turn = sum(r["turn"] for r in good_rides) / len(good_rides)
+    avg_dur = sum(r["duration"] for r in good_rides) / len(good_rides)
+
+    # 값이 낮을수록 선호한다고 가정
+    elev_pref = 1.0 / (avg_elev + 1)
+    turn_pref = 1.0 / (avg_turn + 1)
+    dur_pref = 1.0 / (avg_dur + 1)
+
+    total = elev_pref + turn_pref + dur_pref
+    if total == 0:
+        return get_default_user_weights()
+
+    weights = {
+        "elevation": elev_pref / total,
+        "turn": turn_pref / total,
+        "duration": dur_pref / total
+    }
+
+    return weights
 
 
 # ------------------ 목적지 생성 ------------------
@@ -230,7 +308,6 @@ def calculate_turn_count(points, threshold_deg=35):
         return 0
 
     count = 0
-
     for i in range(1, len(points) - 1):
         b1 = calculate_bearing(points[i - 1], points[i])
         b2 = calculate_bearing(points[i], points[i + 1])
@@ -247,7 +324,7 @@ def calculate_turn_count(points, threshold_deg=35):
 
 # ------------------ 후보 생성 ------------------
 
-def build_candidate(route_json, target_km, idx):
+def build_candidate(route_json, idx):
     try:
         summary = route_json["routes"][0]["summary"]
     except Exception:
@@ -257,7 +334,6 @@ def build_candidate(route_json, target_km, idx):
     duration_min = int(summary["duration"] / 60)
 
     polyline = extract_polyline(route_json)
-
     if len(polyline) < 5:
         return None
 
@@ -331,27 +407,31 @@ def recommend_loop(req: FitnessRecommendRequest):
     start = (req.start_lat, req.start_lng)
 
     destinations = generate_random_destinations(
-        start[0], start[1], req.target_km
+        req.start_lat,
+        req.start_lng,
+        req.target_km
     )
 
     candidates = []
-
     for dest in destinations:
         route_json = get_route(start, dest)
         if not route_json:
             continue
 
-        c = build_candidate(route_json, req.target_km, len(candidates) + 1)
+        c = build_candidate(route_json, len(candidates) + 1)
         if c:
             candidates.append(c)
 
         if len(candidates) >= MAX_CANDIDATES:
             break
 
-    user_weights = get_default_user_weights()
+    rides = [item.dict() for item in req.ride_history]
+    user_weights = get_user_preference_from_history(rides)
+
     candidates = apply_scores(candidates, user_weights)
 
     return {
         "routes": candidates,
-        "count": len(candidates)
+        "count": len(candidates),
+        "user_weights": user_weights
     }
