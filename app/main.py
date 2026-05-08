@@ -15,6 +15,7 @@ KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_KEY")
 GOOGLE_ELEVATION_API_KEY = os.getenv("GOOGLE_ELEVATION_API_KEY")
 
 KAKAO_DIRECTIONS_URL = "https://apis-navi.kakaomobility.com/v1/directions"
+KAKAO_LOCAL_CATEGORY_URL = "https://dapi.kakao.com/v2/local/search/category.json"
 GOOGLE_ELEVATION_URL = "https://maps.googleapis.com/maps/api/elevation/json"
 
 RANDOM_SAMPLES = 12
@@ -36,6 +37,12 @@ class FitnessRecommendRequest(BaseModel):
     start_lng: float
     target_km: float
     ride_history: List[RideHistoryItem] = []
+
+
+class TourRecommendRequest(BaseModel):
+    start_lat: float
+    start_lng: float
+    radius_m: int = 5000
 
 
 # ------------------ 기본 유틸 ------------------
@@ -116,18 +123,15 @@ def get_user_preference_from_history(rides: List[dict]):
             "duration": ride.get("durationMin", 0)
         })
 
-    # 최근 기록 중 반응이 좋은 것 위주
     good_rides = [r for r in scored_rides if r["feedback"] >= 0.7]
 
     if not good_rides:
         good_rides = scored_rides
 
-    # 반응이 좋았던 기록의 평균 특성
     avg_elev = sum(r["elevation"] for r in good_rides) / len(good_rides)
     avg_turn = sum(r["turn"] for r in good_rides) / len(good_rides)
     avg_dur = sum(r["duration"] for r in good_rides) / len(good_rides)
 
-    # 값이 낮을수록 선호한다고 가정
     elev_pref = 1.0 / (avg_elev + 1)
     turn_pref = 1.0 / (avg_turn + 1)
     dur_pref = 1.0 / (avg_dur + 1)
@@ -136,13 +140,11 @@ def get_user_preference_from_history(rides: List[dict]):
     if total == 0:
         return get_default_user_weights()
 
-    weights = {
+    return {
         "elevation": elev_pref / total,
         "turn": turn_pref / total,
         "duration": dur_pref / total
     }
-
-    return weights
 
 
 # ------------------ 목적지 생성 ------------------
@@ -182,10 +184,59 @@ def generate_random_destinations(lat, lon, target_km, sample_count=RANDOM_SAMPLE
     return destinations
 
 
+# ------------------ 카카오 Local 관광지 검색 ------------------
+
+def search_tour_places(lat, lng, radius_m):
+    print("관광지 검색 시작:", lat, lng, radius_m)
+
+    if not KAKAO_REST_API_KEY:
+        print("KAKAO_REST_KEY 없음")
+        return []
+
+    headers = {
+        "Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"
+    }
+
+    params = {
+        "category_group_code": "AT4",
+        "x": lng,
+        "y": lat,
+        "radius": radius_m,
+        "sort": "distance",
+        "size": 15
+    }
+
+    try:
+        response = requests.get(
+            KAKAO_LOCAL_CATEGORY_URL,
+            headers=headers,
+            params=params,
+            timeout=4
+        )
+
+        print("Kakao Local 상태코드:", response.status_code)
+        print("Kakao Local 응답:", response.text[:500])
+
+        if response.status_code != 200:
+            return []
+
+        data = response.json()
+        places = data.get("documents", [])
+
+        print("검색된 관광지 개수:", len(places))
+
+        return places
+
+    except Exception as e:
+        print("관광지 검색 오류:", e)
+        return []
+
+
 # ------------------ 카카오 경로 ------------------
 
 def get_route(start, dest):
     if not KAKAO_REST_API_KEY:
+        print("KAKAO_REST_KEY 없음")
         return {}
 
     headers = {
@@ -205,10 +256,17 @@ def get_route(start, dest):
             params=params,
             timeout=4
         )
+
+        print("Kakao Directions 상태코드:", response.status_code)
+        print("Kakao Directions 응답:", response.text[:300])
+
         if response.status_code != 200:
             return {}
+
         return response.json()
-    except Exception:
+
+    except Exception as e:
+        print("Kakao Directions 오류:", e)
         return {}
 
 
@@ -334,6 +392,7 @@ def build_candidate(route_json, idx):
     duration_min = int(summary["duration"] / 60)
 
     polyline = extract_polyline(route_json)
+
     if len(polyline) < 5:
         return None
 
@@ -352,6 +411,54 @@ def build_candidate(route_json, idx):
     return {
         "route_id": f"r{idx}",
         "title": f"추천 코스 {idx}",
+        "distance_km": distance_km,
+        "duration_min": duration_min,
+        "elevation_gain": int(ascent),
+        "turn_count": turn_count,
+        "score": 0.0,
+        "route_points": [{"lat": lat, "lng": lng} for lat, lng in route_points],
+        "polyline": [[lat, lng] for lat, lng in polyline],
+        "max_grade_percent": round(max_grade, 1)
+    }
+
+
+def build_tour_candidate(route_json, place, idx):
+    try:
+        summary = route_json["routes"][0]["summary"]
+    except Exception:
+        return None
+
+    distance_km = round(summary["distance"] / 1000, 1)
+    duration_min = int(summary["duration"] / 60)
+
+    polyline = extract_polyline(route_json)
+
+    print("관광지 polyline 개수:", len(polyline))
+
+    if len(polyline) < 2:
+        print("polyline 부족")
+        return None
+
+    turn_count = calculate_turn_count(polyline)
+
+    route_points = sample_points(polyline)
+    route_points = remove_duplicate_points(route_points)
+
+    elevations = get_elevations(route_points)
+
+    if len(elevations) == len(route_points):
+        ascent, max_grade = analyze_route(route_points, elevations)
+    else:
+        ascent, max_grade = 0, 0
+
+    place_name = place.get("place_name", "관광지")
+    address = place.get("road_address_name") or place.get("address_name", "")
+
+    return {
+        "route_id": f"tour_{idx}",
+        "title": f"{place_name} 관광 코스",
+        "place_name": place_name,
+        "address": address,
         "distance_km": distance_km,
         "duration_min": duration_min,
         "elevation_gain": int(ascent),
@@ -387,6 +494,36 @@ def apply_scores(candidates, user_weights):
             user_weights["elevation"] * elev_score
             + user_weights["turn"] * turn_score
             + user_weights["duration"] * dur_score
+        )
+
+        c["score"] = round(final_score, 2)
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates
+
+
+def apply_tour_scores(candidates):
+    if not candidates:
+        return candidates
+
+    min_turn = min(c["turn_count"] for c in candidates)
+    max_turn = max(c["turn_count"] for c in candidates)
+
+    min_dur = min(c["duration_min"] for c in candidates)
+    max_dur = max(c["duration_min"] for c in candidates)
+
+    min_dist = min(c["distance_km"] for c in candidates)
+    max_dist = max(c["distance_km"] for c in candidates)
+
+    for c in candidates:
+        turn_score = normalize_low_better(c["turn_count"], min_turn, max_turn)
+        dur_score = normalize_low_better(c["duration_min"], min_dur, max_dur)
+        dist_score = normalize_low_better(c["distance_km"], min_dist, max_dist)
+
+        final_score = (
+            0.3 * turn_score
+            + 0.4 * dur_score
+            + 0.3 * dist_score
         )
 
         c["score"] = round(final_score, 2)
@@ -434,4 +571,74 @@ def recommend_loop(req: FitnessRecommendRequest):
         "routes": candidates,
         "count": len(candidates),
         "user_weights": user_weights
+    }
+
+
+@app.post("/tour/recommend")
+def recommend_tour_routes(req: TourRecommendRequest):
+    start = (req.start_lat, req.start_lng)
+
+    radius_m = max(3000, min(req.radius_m, 10000))
+
+    print("관광지 추천 요청:", req.start_lat, req.start_lng, radius_m)
+
+    places = search_tour_places(
+        lat=req.start_lat,
+        lng=req.start_lng,
+        radius_m=radius_m
+    )
+
+    print("places 개수:", len(places))
+
+    candidates = []
+
+    for place in places:
+        print("관광지 후보:", place.get("place_name"))
+
+        try:
+            dest_lat = float(place["y"])
+            dest_lng = float(place["x"])
+        except Exception as e:
+            print("좌표 변환 실패:", e)
+            continue
+
+        dest = (dest_lat, dest_lng)
+
+        route_json = get_route(start, dest)
+
+        print("Directions 응답 있음?:", bool(route_json))
+
+        if route_json:
+            try:
+                print("Directions result_code:", route_json.get("routes", [{}])[0].get("result_code"))
+                print("Directions result_msg:", route_json.get("routes", [{}])[0].get("result_msg"))
+            except Exception:
+                pass
+
+        if not route_json:
+            print("경로 생성 실패:", place.get("place_name"))
+            continue
+
+        candidate = build_tour_candidate(
+            route_json=route_json,
+            place=place,
+            idx=len(candidates) + 1
+        )
+
+        if candidate:
+            print("후보 추가 성공:", candidate["title"])
+            candidates.append(candidate)
+        else:
+            print("후보 생성 실패:", place.get("place_name"))
+
+        if len(candidates) >= MAX_CANDIDATES:
+            break
+
+    candidates = apply_tour_scores(candidates)
+
+    print("최종 추천 개수:", len(candidates))
+
+    return {
+        "routes": candidates,
+        "count": len(candidates)
     }
