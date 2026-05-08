@@ -269,21 +269,108 @@ def get_route(start, dest):
         print("Kakao Directions 오류:", e)
         return {}
 
+def get_route_with_waypoints(start, tour_places):
+    if not KAKAO_REST_API_KEY:
+        print("KAKAO_REST_KEY 없음")
+        return {}
+
+    if len(tour_places) < 2:
+        return {}
+
+    headers = {
+        "Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"
+    }
+
+    # 마지막 관광지를 최종 목적지로 사용
+    destination_place = tour_places[-1]
+    destination_lat = float(destination_place["y"])
+    destination_lng = float(destination_place["x"])
+
+    # 앞 관광지들은 경유지로 사용
+    waypoint_places = tour_places[:-1]
+
+    waypoints = []
+    for place in waypoint_places:
+        lat = float(place["y"])
+        lng = float(place["x"])
+        name = place.get("place_name", "관광지")
+        waypoints.append(f"{lng},{lat},name={name}")
+
+    params = {
+        "origin": f"{start[1]},{start[0]}",
+        "destination": f"{destination_lng},{destination_lat},name={destination_place.get('place_name', '관광지')}",
+        "waypoints": "|".join(waypoints),
+        "priority": "RECOMMEND"
+    }
+
+    try:
+        response = requests.get(
+            KAKAO_DIRECTIONS_URL,
+            headers=headers,
+            params=params,
+            timeout=4
+        )
+
+        print("관광 코스 Directions 상태코드:", response.status_code)
+        print("관광 코스 Directions 응답:", response.text[:300])
+
+        if response.status_code != 200:
+            return {}
+
+        return response.json()
+
+    except Exception as e:
+        print("관광 코스 Directions 오류:", e)
+        return {}
+
+def make_tour_place_groups(places, group_size=3, group_count=6):
+    if len(places) < group_size:
+        return []
+
+    groups = []
+    used_keys = set()
+
+    for _ in range(group_count * 3):
+        group = random.sample(places, group_size)
+
+        key = tuple(sorted([p.get("id", p.get("place_name", "")) for p in group]))
+        if key in used_keys:
+            continue
+
+        used_keys.add(key)
+
+        # 현재 위치 기준 가까운 순서대로 방문하게 정렬
+        group.sort(key=lambda p: int(p.get("distance", 999999)))
+
+        groups.append(group)
+
+        if len(groups) >= group_count:
+            break
+
+    return groups
 
 def extract_polyline(route_json):
     points = []
 
     try:
-        roads = route_json["routes"][0]["sections"][0]["roads"]
-        for road in roads:
-            v = road["vertexes"]
-            for i in range(0, len(v), 2):
-                points.append((v[i + 1], v[i]))
-    except Exception:
+        sections = route_json["routes"][0]["sections"]
+
+        for section in sections:
+            roads = section.get("roads", [])
+
+            for road in roads:
+                vertexes = road.get("vertexes", [])
+
+                for i in range(0, len(vertexes), 2):
+                    lng = vertexes[i]
+                    lat = vertexes[i + 1]
+                    points.append((lat, lng))
+
+    except Exception as e:
+        print("polyline 추출 오류:", e)
         return []
 
     return remove_duplicate_points(points)
-
 
 # ------------------ 고도 분석 ------------------
 
@@ -469,6 +556,33 @@ def build_tour_candidate(route_json, place, idx):
         "max_grade_percent": round(max_grade, 1)
     }
 
+def build_tour_course_candidate(route_json, tour_places, idx):
+    candidate = build_tour_candidate(
+        route_json=route_json,
+        place=tour_places[-1],
+        idx=idx
+    )
+
+    if not candidate:
+        return None
+
+    place_names = [p.get("place_name", "관광지") for p in tour_places]
+
+    candidate["route_id"] = f"tour_course_{idx}"
+    candidate["title"] = " → ".join(place_names)
+    candidate["place_name"] = place_names[-1]
+    candidate["address"] = tour_places[-1].get("road_address_name") or tour_places[-1].get("address_name", "")
+    candidate["tour_places"] = [
+        {
+            "name": p.get("place_name", "관광지"),
+            "lat": float(p["y"]),
+            "lng": float(p["x"]),
+            "address": p.get("road_address_name") or p.get("address_name", "")
+        }
+        for p in tour_places
+    ]
+
+    return candidate
 
 # ------------------ 점수 계산 ------------------
 
@@ -580,7 +694,7 @@ def recommend_tour_routes(req: TourRecommendRequest):
 
     radius_m = max(3000, min(req.radius_m, 10000))
 
-    print("관광지 추천 요청:", req.start_lat, req.start_lng, radius_m)
+    print("관광지 코스 추천 요청:", req.start_lat, req.start_lng, radius_m)
 
     places = search_tour_places(
         lat=req.start_lat,
@@ -588,55 +702,55 @@ def recommend_tour_routes(req: TourRecommendRequest):
         radius_m=radius_m
     )
 
-    print("places 개수:", len(places))
+    print("검색된 관광지 개수:", len(places))
+
+    if len(places) < 3:
+        print("관광지 3개 미만이라 코스 생성 불가")
+        return {
+            "routes": [],
+            "count": 0
+        }
+
+    place_groups = make_tour_place_groups(
+        places=places,
+        group_size=3,
+        group_count=8
+    )
+
+    print("생성된 관광 코스 후보 그룹 수:", len(place_groups))
 
     candidates = []
 
-    for place in places:
-        print("관광지 후보:", place.get("place_name"))
+    for group in place_groups:
+        print("관광 코스 후보:", [p.get("place_name") for p in group])
 
-        try:
-            dest_lat = float(place["y"])
-            dest_lng = float(place["x"])
-        except Exception as e:
-            print("좌표 변환 실패:", e)
-            continue
-
-        dest = (dest_lat, dest_lng)
-
-        route_json = get_route(start, dest)
-
-        print("Directions 응답 있음?:", bool(route_json))
-
-        if route_json:
-            try:
-                print("Directions result_code:", route_json.get("routes", [{}])[0].get("result_code"))
-                print("Directions result_msg:", route_json.get("routes", [{}])[0].get("result_msg"))
-            except Exception:
-                pass
+        route_json = get_route_with_waypoints(
+            start=start,
+            tour_places=group
+        )
 
         if not route_json:
-            print("경로 생성 실패:", place.get("place_name"))
+            print("관광 코스 경로 생성 실패")
             continue
 
-        candidate = build_tour_candidate(
+        candidate = build_tour_course_candidate(
             route_json=route_json,
-            place=place,
+            tour_places=group,
             idx=len(candidates) + 1
         )
 
         if candidate:
-            print("후보 추가 성공:", candidate["title"])
+            print("관광 코스 후보 추가 성공:", candidate["title"])
             candidates.append(candidate)
         else:
-            print("후보 생성 실패:", place.get("place_name"))
+            print("관광 코스 후보 생성 실패")
 
         if len(candidates) >= MAX_CANDIDATES:
             break
 
     candidates = apply_tour_scores(candidates)
 
-    print("최종 추천 개수:", len(candidates))
+    print("최종 관광 코스 추천 개수:", len(candidates))
 
     return {
         "routes": candidates,
