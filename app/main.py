@@ -13,6 +13,7 @@ app = FastAPI()
 
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_KEY")
 GOOGLE_ELEVATION_API_KEY = os.getenv("GOOGLE_ELEVATION_API_KEY")
+TOUR_API_KEY = os.getenv("TOUR_API_KEY")
 
 KAKAO_DIRECTIONS_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 KAKAO_LOCAL_CATEGORY_URL = "https://dapi.kakao.com/v2/local/search/category.json"
