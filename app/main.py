@@ -5,6 +5,7 @@ import requests
 import math
 import os
 import random
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,9 +20,14 @@ KAKAO_DIRECTIONS_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 KAKAO_LOCAL_CATEGORY_URL = "https://dapi.kakao.com/v2/local/search/category.json"
 GOOGLE_ELEVATION_URL = "https://maps.googleapis.com/maps/api/elevation/json"
 
+TOUR_API_SEARCH_KEYWORD_URL = "https://apis.data.go.kr/B551011/KorService2/searchKeyword2"
+TOUR_API_DETAIL_COMMON_URL = "https://apis.data.go.kr/B551011/KorService2/detailCommon2"
+
 RANDOM_SAMPLES = 12
 MAX_CANDIDATES = 3
 ELEV_SAMPLE_POINTS = 10
+
+tour_description_cache = {}
 
 
 class RideHistoryItem(BaseModel):
@@ -45,8 +51,6 @@ class TourRecommendRequest(BaseModel):
     start_lng: float
     radius_m: int = 5000
 
-
-# ------------------ 기본 유틸 ------------------
 
 def haversine(p1, p2):
     r = 6371000
@@ -88,8 +92,6 @@ def get_default_user_weights():
         "duration": 0.3
     }
 
-
-# ------------------ 사용자 맞춤 추천 ------------------
 
 def satisfaction_to_score(satisfaction: str) -> float:
     if satisfaction == "만족":
@@ -148,8 +150,6 @@ def get_user_preference_from_history(rides: List[dict]):
     }
 
 
-# ------------------ 목적지 생성 ------------------
-
 def destination_point(lat, lon, bearing_deg, distance_km):
     r = 6371.0
     bearing = math.radians(bearing_deg)
@@ -184,8 +184,6 @@ def generate_random_destinations(lat, lon, target_km, sample_count=RANDOM_SAMPLE
 
     return destinations
 
-
-# ------------------ 카카오 Local 관광지 검색 ------------------
 
 def search_tour_places(lat, lng, radius_m):
     print("관광지 검색 시작:", lat, lng, radius_m)
@@ -233,7 +231,139 @@ def search_tour_places(lat, lng, radius_m):
         return []
 
 
-# ------------------ 카카오 경로 ------------------
+def clean_html(text):
+    if not text:
+        return ""
+
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = (
+        text.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+    )
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def get_tour_description(place_name):
+    if not place_name:
+        return ""
+
+    if place_name in tour_description_cache:
+        return tour_description_cache[place_name]
+
+    if not TOUR_API_KEY:
+        print("TOUR_API_KEY 없음")
+        return ""
+
+    try:
+        search_params = {
+            "serviceKey": TOUR_API_KEY,
+            "MobileOS": "ETC",
+            "MobileApp": "SmartHandle",
+            "_type": "json",
+            "numOfRows": 1,
+            "pageNo": 1,
+            "keyword": place_name
+        }
+
+        search_res = requests.get(
+            TOUR_API_SEARCH_KEYWORD_URL,
+            params=search_params,
+            timeout=5
+        )
+
+        print("TourAPI 키워드 검색:", place_name, search_res.status_code)
+
+        if search_res.status_code != 200:
+            print("TourAPI 키워드 검색 실패:", search_res.text[:300])
+            tour_description_cache[place_name] = ""
+            return ""
+
+        search_data = search_res.json()
+
+        items = (
+            search_data.get("response", {})
+            .get("body", {})
+            .get("items", {})
+            .get("item", [])
+        )
+
+        if not items:
+            print("TourAPI 검색 결과 없음:", place_name)
+            tour_description_cache[place_name] = ""
+            return ""
+
+        if isinstance(items, dict):
+            items = [items]
+
+        content_id = items[0].get("contentid")
+        content_type_id = items[0].get("contenttypeid")
+
+        if not content_id:
+            print("TourAPI contentId 없음:", place_name)
+            tour_description_cache[place_name] = ""
+            return ""
+
+        detail_params = {
+            "serviceKey": TOUR_API_KEY,
+            "MobileOS": "ETC",
+            "MobileApp": "SmartHandle",
+            "_type": "json",
+            "contentId": content_id,
+            "contentTypeId": content_type_id,
+            "defaultYN": "Y",
+            "overviewYN": "Y"
+        }
+
+        detail_res = requests.get(
+            TOUR_API_DETAIL_COMMON_URL,
+            params=detail_params,
+            timeout=5
+        )
+
+        print("TourAPI 상세 조회:", place_name, detail_res.status_code)
+
+        if detail_res.status_code != 200:
+            print("TourAPI 상세 조회 실패:", detail_res.text[:300])
+            tour_description_cache[place_name] = ""
+            return ""
+
+        detail_data = detail_res.json()
+
+        detail_items = (
+            detail_data.get("response", {})
+            .get("body", {})
+            .get("items", {})
+            .get("item", [])
+        )
+
+        if not detail_items:
+            print("TourAPI 상세 결과 없음:", place_name)
+            tour_description_cache[place_name] = ""
+            return ""
+
+        if isinstance(detail_items, dict):
+            detail_items = [detail_items]
+
+        overview = detail_items[0].get("overview", "")
+        description = clean_html(overview)
+
+        if description:
+            print("TourAPI 설명 조회 성공:", place_name)
+        else:
+            print("TourAPI overview 없음:", place_name)
+
+        tour_description_cache[place_name] = description
+        return description
+
+    except Exception as e:
+        print("TourAPI 설명 조회 오류:", place_name, e)
+        tour_description_cache[place_name] = ""
+        return ""
+
 
 def get_route(start, dest):
     if not KAKAO_REST_API_KEY:
@@ -270,6 +400,7 @@ def get_route(start, dest):
         print("Kakao Directions 오류:", e)
         return {}
 
+
 def get_route_with_waypoints(start, tour_places):
     if not KAKAO_REST_API_KEY:
         print("KAKAO_REST_KEY 없음")
@@ -282,12 +413,10 @@ def get_route_with_waypoints(start, tour_places):
         "Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"
     }
 
-    # 마지막 관광지를 최종 목적지로 사용
     destination_place = tour_places[-1]
     destination_lat = float(destination_place["y"])
     destination_lng = float(destination_place["x"])
 
-    # 앞 관광지들은 경유지로 사용
     waypoint_places = tour_places[:-1]
 
     waypoints = []
@@ -324,6 +453,7 @@ def get_route_with_waypoints(start, tour_places):
         print("관광 코스 Directions 오류:", e)
         return {}
 
+
 def make_tour_place_groups(places, group_size=3, group_count=6):
     if len(places) < group_size:
         return []
@@ -340,15 +470,14 @@ def make_tour_place_groups(places, group_size=3, group_count=6):
 
         used_keys.add(key)
 
-        # 현재 위치 기준 가까운 순서대로 방문하게 정렬
         group.sort(key=lambda p: int(p.get("distance", 999999)))
-
         groups.append(group)
 
         if len(groups) >= group_count:
             break
 
     return groups
+
 
 def extract_polyline(route_json):
     points = []
@@ -373,7 +502,6 @@ def extract_polyline(route_json):
 
     return remove_duplicate_points(points)
 
-# ------------------ 고도 분석 ------------------
 
 def sample_points(points, n=ELEV_SAMPLE_POINTS):
     if len(points) <= n:
@@ -431,8 +559,6 @@ def analyze_route(points, elevations):
     return total_ascent, max_grade
 
 
-# ------------------ 회전 수 계산 ------------------
-
 def calculate_bearing(p1, p2):
     lat1, lon1 = map(math.radians, p1)
     lat2, lon2 = map(math.radians, p2)
@@ -467,8 +593,6 @@ def calculate_turn_count(points, threshold_deg=35):
 
     return count
 
-
-# ------------------ 후보 생성 ------------------
 
 def build_candidate(route_json, idx):
     try:
@@ -557,6 +681,7 @@ def build_tour_candidate(route_json, place, idx):
         "max_grade_percent": round(max_grade, 1)
     }
 
+
 def build_tour_course_candidate(route_json, tour_places, idx):
     candidate = build_tour_candidate(
         route_json=route_json,
@@ -573,19 +698,23 @@ def build_tour_course_candidate(route_json, tour_places, idx):
     candidate["title"] = " → ".join(place_names)
     candidate["place_name"] = place_names[-1]
     candidate["address"] = tour_places[-1].get("road_address_name") or tour_places[-1].get("address_name", "")
-    candidate["tour_places"] = [
-        {
-            "name": p.get("place_name", "관광지"),
+
+    candidate["tour_places"] = []
+    for p in tour_places:
+        place_name = p.get("place_name", "관광지")
+        address = p.get("road_address_name") or p.get("address_name", "")
+        description = get_tour_description(place_name) or ""
+
+        candidate["tour_places"].append({
+            "name": place_name,
             "lat": float(p["y"]),
             "lng": float(p["x"]),
-            "address": p.get("road_address_name") or p.get("address_name", "")
-        }
-        for p in tour_places
-    ]
+            "address": address,
+            "description": description
+        })
 
     return candidate
 
-# ------------------ 점수 계산 ------------------
 
 def apply_scores(candidates, user_weights):
     if not candidates:
@@ -646,8 +775,6 @@ def apply_tour_scores(candidates):
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates
 
-
-# ------------------ API ------------------
 
 @app.get("/")
 def root():
