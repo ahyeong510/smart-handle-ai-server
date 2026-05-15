@@ -52,6 +52,8 @@ class TourRecommendRequest(BaseModel):
     radius_m: int = 5000
 
 
+# ------------------ 기본 유틸 ------------------
+
 def haversine(p1, p2):
     r = 6371000
     lat1, lon1 = map(math.radians, p1)
@@ -92,6 +94,8 @@ def get_default_user_weights():
         "duration": 0.3
     }
 
+
+# ------------------ 사용자 맞춤 추천 ------------------
 
 def satisfaction_to_score(satisfaction: str) -> float:
     if satisfaction == "만족":
@@ -150,6 +154,8 @@ def get_user_preference_from_history(rides: List[dict]):
     }
 
 
+# ------------------ 목적지 생성 ------------------
+
 def destination_point(lat, lon, bearing_deg, distance_km):
     r = 6371.0
     bearing = math.radians(bearing_deg)
@@ -184,6 +190,8 @@ def generate_random_destinations(lat, lon, target_km, sample_count=RANDOM_SAMPLE
 
     return destinations
 
+
+# ------------------ 카카오 Local 관광지 검색 ------------------
 
 def search_tour_places(lat, lng, radius_m):
     print("관광지 검색 시작:", lat, lng, radius_m)
@@ -231,11 +239,13 @@ def search_tour_places(lat, lng, radius_m):
         return []
 
 
+# ------------------ 한국관광공사 TourAPI 설명 조회 ------------------
+
 def clean_html(text):
     if not text:
         return ""
 
-    text = re.sub(r"<[^>]*>", " ", text)
+    text = re.sub(r"<[^>]*>", " ", str(text))
     text = (
         text.replace("&nbsp;", " ")
         .replace("&lt;", "<")
@@ -247,6 +257,29 @@ def clean_html(text):
     return text.strip()
 
 
+def normalize_tour_api_items(items, place_name, label):
+    """
+    TourAPI 응답의 item은 경우에 따라
+    dict / list / str / 빈 문자열 / 없음으로 올 수 있어서 안전하게 정리한다.
+    """
+    if not items:
+        print(f"TourAPI {label} 결과 없음:", place_name)
+        return []
+
+    if isinstance(items, dict):
+        return [items]
+
+    if isinstance(items, list):
+        return [item for item in items if isinstance(item, dict)]
+
+    if isinstance(items, str):
+        print(f"TourAPI {label} 결과 문자열:", place_name, items[:100])
+        return []
+
+    print(f"TourAPI {label} 결과 형식 이상:", place_name, type(items))
+    return []
+
+
 def get_tour_description(place_name):
     if not place_name:
         return ""
@@ -256,6 +289,7 @@ def get_tour_description(place_name):
 
     if not TOUR_API_KEY:
         print("TOUR_API_KEY 없음")
+        tour_description_cache[place_name] = ""
         return ""
 
     try:
@@ -282,25 +316,30 @@ def get_tour_description(place_name):
             tour_description_cache[place_name] = ""
             return ""
 
-        search_data = search_res.json()
+        try:
+            search_data = search_res.json()
+        except Exception as e:
+            print("TourAPI 키워드 검색 JSON 파싱 실패:", place_name, e)
+            print("응답 일부:", search_res.text[:300])
+            tour_description_cache[place_name] = ""
+            return ""
 
-        items = (
+        raw_items = (
             search_data.get("response", {})
             .get("body", {})
             .get("items", {})
             .get("item", [])
         )
 
-        if not items:
-            print("TourAPI 검색 결과 없음:", place_name)
+        search_items = normalize_tour_api_items(raw_items, place_name, "검색")
+
+        if not search_items:
             tour_description_cache[place_name] = ""
             return ""
 
-        if isinstance(items, dict):
-            items = [items]
-
-        content_id = items[0].get("contentid")
-        content_type_id = items[0].get("contenttypeid")
+        first_item = search_items[0]
+        content_id = first_item.get("contentid")
+        content_type_id = first_item.get("contenttypeid")
 
         if not content_id:
             print("TourAPI contentId 없음:", place_name)
@@ -331,22 +370,26 @@ def get_tour_description(place_name):
             tour_description_cache[place_name] = ""
             return ""
 
-        detail_data = detail_res.json()
+        try:
+            detail_data = detail_res.json()
+        except Exception as e:
+            print("TourAPI 상세 조회 JSON 파싱 실패:", place_name, e)
+            print("응답 일부:", detail_res.text[:300])
+            tour_description_cache[place_name] = ""
+            return ""
 
-        detail_items = (
+        raw_detail_items = (
             detail_data.get("response", {})
             .get("body", {})
             .get("items", {})
             .get("item", [])
         )
 
+        detail_items = normalize_tour_api_items(raw_detail_items, place_name, "상세")
+
         if not detail_items:
-            print("TourAPI 상세 결과 없음:", place_name)
             tour_description_cache[place_name] = ""
             return ""
-
-        if isinstance(detail_items, dict):
-            detail_items = [detail_items]
 
         overview = detail_items[0].get("overview", "")
         description = clean_html(overview)
@@ -364,6 +407,8 @@ def get_tour_description(place_name):
         tour_description_cache[place_name] = ""
         return ""
 
+
+# ------------------ 카카오 경로 ------------------
 
 def get_route(start, dest):
     if not KAKAO_REST_API_KEY:
@@ -503,6 +548,8 @@ def extract_polyline(route_json):
     return remove_duplicate_points(points)
 
 
+# ------------------ 고도 분석 ------------------
+
 def sample_points(points, n=ELEV_SAMPLE_POINTS):
     if len(points) <= n:
         return points
@@ -559,6 +606,8 @@ def analyze_route(points, elevations):
     return total_ascent, max_grade
 
 
+# ------------------ 회전 수 계산 ------------------
+
 def calculate_bearing(p1, p2):
     lat1, lon1 = map(math.radians, p1)
     lat2, lon2 = map(math.radians, p2)
@@ -593,6 +642,8 @@ def calculate_turn_count(points, threshold_deg=35):
 
     return count
 
+
+# ------------------ 후보 생성 ------------------
 
 def build_candidate(route_json, idx):
     try:
@@ -700,6 +751,7 @@ def build_tour_course_candidate(route_json, tour_places, idx):
     candidate["address"] = tour_places[-1].get("road_address_name") or tour_places[-1].get("address_name", "")
 
     candidate["tour_places"] = []
+
     for p in tour_places:
         place_name = p.get("place_name", "관광지")
         address = p.get("road_address_name") or p.get("address_name", "")
@@ -715,6 +767,8 @@ def build_tour_course_candidate(route_json, tour_places, idx):
 
     return candidate
 
+
+# ------------------ 점수 계산 ------------------
 
 def apply_scores(candidates, user_weights):
     if not candidates:
@@ -775,6 +829,8 @@ def apply_tour_scores(candidates):
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates
 
+
+# ------------------ API ------------------
 
 @app.get("/")
 def root():
