@@ -280,6 +280,41 @@ def normalize_tour_api_items(items, place_name, label):
     return []
 
 
+def extract_tour_api_items(data, place_name, label):
+    """
+    TourAPI 응답에서 response.body.items.item을 안전하게 꺼낸다.
+
+    중요:
+    TourAPI는 검색 결과가 없을 때 items가 dict가 아니라
+    빈 문자열("")로 내려오는 경우가 있다.
+    그래서 바로 .get("item")을 하면
+    'str' object has no attribute 'get' 오류가 난다.
+    """
+    response = data.get("response", {})
+    body = response.get("body", {})
+    items = body.get("items", {})
+
+    if not items:
+        print(f"TourAPI {label} items 없음:", place_name)
+        return []
+
+    if isinstance(items, str):
+        print(f"TourAPI {label} items 문자열:", place_name, items[:100])
+        return []
+
+    if not isinstance(items, dict):
+        print(f"TourAPI {label} items 형식 이상:", place_name, type(items))
+        return []
+
+    raw_items = items.get("item", [])
+
+    return normalize_tour_api_items(
+        raw_items,
+        place_name,
+        label
+    )
+
+
 def get_tour_description(place_name):
     if not place_name:
         return ""
@@ -324,14 +359,11 @@ def get_tour_description(place_name):
             tour_description_cache[place_name] = ""
             return ""
 
-        raw_items = (
-            search_data.get("response", {})
-            .get("body", {})
-            .get("items", {})
-            .get("item", [])
+        search_items = extract_tour_api_items(
+            search_data,
+            place_name,
+            "검색"
         )
-
-        search_items = normalize_tour_api_items(raw_items, place_name, "검색")
 
         if not search_items:
             tour_description_cache[place_name] = ""
@@ -378,14 +410,11 @@ def get_tour_description(place_name):
             tour_description_cache[place_name] = ""
             return ""
 
-        raw_detail_items = (
-            detail_data.get("response", {})
-            .get("body", {})
-            .get("items", {})
-            .get("item", [])
+        detail_items = extract_tour_api_items(
+            detail_data,
+            place_name,
+            "상세"
         )
-
-        detail_items = normalize_tour_api_items(raw_detail_items, place_name, "상세")
 
         if not detail_items:
             tour_description_cache[place_name] = ""
