@@ -193,6 +193,69 @@ def generate_random_destinations(lat, lon, target_km, sample_count=RANDOM_SAMPLE
 
 # ------------------ 카카오 Local 관광지 검색 ------------------
 
+# ------------------ 관광지 필터링 ------------------
+
+def filter_tour_places(places):
+    exclude_keywords = [
+        "카페",
+        "외식",
+        "상점가",
+        "골목형상점가",
+        "맛집",
+        "식당",
+        "음식",
+        "주차장",
+        "화장실",
+        "매점",
+        "휴게소",
+        "센터",
+    ]
+
+    include_keywords = [
+        "공원",
+        "호수",
+        "저수지",
+        "산",
+        "성",
+        "궁",
+        "사찰",
+        "절",
+        "박물관",
+        "미술관",
+        "기념관",
+        "전망대",
+        "유적",
+        "문화재",
+        "생태",
+        "숲",
+        "둘레길",
+        "산책로",
+        "수목원",
+        "성곽길",
+        "팔색길",
+    ]
+
+    result = []
+
+    for place in places:
+        name = place.get("place_name", "")
+        category = place.get("category_name", "")
+        text = name + " " + category
+
+        if any(word in text for word in exclude_keywords):
+            continue
+
+        if any(word in text for word in include_keywords):
+            result.append(place)
+
+    if len(result) >= 3:
+        return result
+
+    return places
+
+
+# ------------------ 카카오 Local 관광지 검색 ------------------
+
 def search_tour_places(lat, lng, radius_m):
     print("관광지 검색 시작:", lat, lng, radius_m)
 
@@ -228,16 +291,23 @@ def search_tour_places(lat, lng, radius_m):
             return []
 
         data = response.json()
+
         places = data.get("documents", [])
 
         print("검색된 관광지 개수:", len(places))
 
-        return places
+        filtered_places = filter_tour_places(places)
+
+        print("필터링 후 관광지 개수:", len(filtered_places))
+
+        for p in filtered_places:
+            print("필터링 통과 관광지:", p.get("place_name"))
+
+        return filtered_places
 
     except Exception as e:
         print("관광지 검색 오류:", e)
         return []
-
 
 # ------------------ 한국관광공사 TourAPI 설명 조회 ------------------
 
