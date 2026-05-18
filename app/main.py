@@ -395,6 +395,11 @@ def make_tour_search_keywords(place_name):
 def search_tour_content(place_name):
     keywords = make_tour_search_keywords(place_name)
 
+    # TourAPI contenttypeid
+    # 12: 관광지, 14: 문화시설, 15: 축제/공연/행사, 25: 여행코스, 28: 레포츠
+    # 32: 숙박, 39: 음식점은 제외
+    allowed_content_types = {"12", "14", "15", "25", "28"}
+
     for keyword in keywords:
         try:
             search_params = {
@@ -402,7 +407,7 @@ def search_tour_content(place_name):
                 "MobileOS": "ETC",
                 "MobileApp": "SmartHandle",
                 "_type": "json",
-                "numOfRows": 3,
+                "numOfRows": 10,
                 "pageNo": 1,
                 "keyword": keyword
             }
@@ -435,16 +440,38 @@ def search_tour_content(place_name):
             if not search_items:
                 continue
 
-            first_item = search_items[0]
-            content_id = first_item.get("contentid")
-            content_type_id = first_item.get("contenttypeid")
-            title = first_item.get("title", "")
+            selected_item = None
+
+            for item in search_items:
+                content_type_id = str(item.get("contenttypeid", ""))
+                title = item.get("title", "")
+
+                if content_type_id in allowed_content_types:
+                    selected_item = item
+                    break
+
+            if not selected_item:
+                print("TourAPI 관광지 타입 결과 없음:", keyword)
+                continue
+
+            content_id = selected_item.get("contentid")
+            content_type_id = selected_item.get("contenttypeid")
+            title = selected_item.get("title", "")
 
             if not content_id:
                 print("TourAPI contentId 없음:", keyword)
                 continue
 
-            print("TourAPI 검색 매칭 성공:", place_name, "=>", keyword, "/", title)
+            print(
+                "TourAPI 검색 매칭 성공:",
+                place_name,
+                "=>",
+                keyword,
+                "/",
+                title,
+                "/",
+                content_type_id
+            )
 
             return content_id, content_type_id, title
 
