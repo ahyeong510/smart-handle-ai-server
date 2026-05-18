@@ -191,8 +191,6 @@ def generate_random_destinations(lat, lon, target_km, sample_count=RANDOM_SAMPLE
     return destinations
 
 
-# ------------------ 카카오 Local 관광지 검색 ------------------
-
 # ------------------ 관광지 필터링 ------------------
 
 def filter_tour_places(places):
@@ -291,7 +289,6 @@ def search_tour_places(lat, lng, radius_m):
             return []
 
         data = response.json()
-
         places = data.get("documents", [])
 
         print("검색된 관광지 개수:", len(places))
@@ -308,6 +305,7 @@ def search_tour_places(lat, lng, radius_m):
     except Exception as e:
         print("관광지 검색 오류:", e)
         return []
+
 
 # ------------------ 한국관광공사 TourAPI 설명 조회 ------------------
 
@@ -328,10 +326,6 @@ def clean_html(text):
 
 
 def normalize_tour_api_items(items, place_name, label):
-    """
-    TourAPI 응답의 item은 경우에 따라
-    dict / list / str / 빈 문자열 / 없음으로 올 수 있어서 안전하게 정리한다.
-    """
     if not items:
         print(f"TourAPI {label} 결과 없음:", place_name)
         return []
@@ -351,15 +345,6 @@ def normalize_tour_api_items(items, place_name, label):
 
 
 def extract_tour_api_items(data, place_name, label):
-    """
-    TourAPI 응답에서 response.body.items.item을 안전하게 꺼낸다.
-
-    중요:
-    TourAPI는 검색 결과가 없을 때 items가 dict가 아니라
-    빈 문자열("")로 내려오는 경우가 있다.
-    그래서 바로 .get("item")을 하면
-    'str' object has no attribute 'get' 오류가 난다.
-    """
     response = data.get("response", {})
     body = response.get("body", {})
     items = body.get("items", {})
@@ -377,12 +362,97 @@ def extract_tour_api_items(data, place_name, label):
         return []
 
     raw_items = items.get("item", [])
+    return normalize_tour_api_items(raw_items, place_name, label)
 
-    return normalize_tour_api_items(
-        raw_items,
-        place_name,
-        label
-    )
+
+def make_tour_search_keywords(place_name):
+    keywords = [place_name]
+
+    if "수원팔색길" in place_name:
+        keywords.append("수원 팔색길")
+        keywords.append("팔색길")
+        keywords.append("수원화성")
+        keywords.append("수원 화성")
+        keywords.append("화성행궁")
+
+    if "화성성곽길" in place_name:
+        keywords.append("수원화성")
+        keywords.append("수원 화성")
+        keywords.append("화성행궁")
+
+    if "광교저수지" in place_name or "청송못" in place_name:
+        keywords.append("광교호수공원")
+        keywords.append("광교 호수공원")
+
+    result = []
+    for keyword in keywords:
+        if keyword and keyword not in result:
+            result.append(keyword)
+
+    return result
+
+
+def search_tour_content(place_name):
+    keywords = make_tour_search_keywords(place_name)
+
+    for keyword in keywords:
+        try:
+            search_params = {
+                "serviceKey": TOUR_API_KEY,
+                "MobileOS": "ETC",
+                "MobileApp": "SmartHandle",
+                "_type": "json",
+                "numOfRows": 3,
+                "pageNo": 1,
+                "keyword": keyword
+            }
+
+            search_res = requests.get(
+                TOUR_API_SEARCH_KEYWORD_URL,
+                params=search_params,
+                timeout=5
+            )
+
+            print("TourAPI 키워드 검색:", place_name, "=>", keyword, search_res.status_code)
+
+            if search_res.status_code != 200:
+                print("TourAPI 키워드 검색 실패:", search_res.text[:300])
+                continue
+
+            try:
+                search_data = search_res.json()
+            except Exception as e:
+                print("TourAPI 키워드 검색 JSON 파싱 실패:", keyword, e)
+                print("응답 일부:", search_res.text[:300])
+                continue
+
+            search_items = extract_tour_api_items(
+                search_data,
+                keyword,
+                "검색"
+            )
+
+            if not search_items:
+                continue
+
+            first_item = search_items[0]
+            content_id = first_item.get("contentid")
+            content_type_id = first_item.get("contenttypeid")
+            title = first_item.get("title", "")
+
+            if not content_id:
+                print("TourAPI contentId 없음:", keyword)
+                continue
+
+            print("TourAPI 검색 매칭 성공:", place_name, "=>", keyword, "/", title)
+
+            return content_id, content_type_id, title
+
+        except Exception as e:
+            print("TourAPI 키워드 검색 오류:", place_name, keyword, e)
+            continue
+
+    return None, None, ""
 
 
 def get_tour_description(place_name):
@@ -398,53 +468,10 @@ def get_tour_description(place_name):
         return ""
 
     try:
-        search_params = {
-            "serviceKey": TOUR_API_KEY,
-            "MobileOS": "ETC",
-            "MobileApp": "SmartHandle",
-            "_type": "json",
-            "numOfRows": 1,
-            "pageNo": 1,
-            "keyword": place_name
-        }
-
-        search_res = requests.get(
-            TOUR_API_SEARCH_KEYWORD_URL,
-            params=search_params,
-            timeout=5
-        )
-
-        print("TourAPI 키워드 검색:", place_name, search_res.status_code)
-
-        if search_res.status_code != 200:
-            print("TourAPI 키워드 검색 실패:", search_res.text[:300])
-            tour_description_cache[place_name] = ""
-            return ""
-
-        try:
-            search_data = search_res.json()
-        except Exception as e:
-            print("TourAPI 키워드 검색 JSON 파싱 실패:", place_name, e)
-            print("응답 일부:", search_res.text[:300])
-            tour_description_cache[place_name] = ""
-            return ""
-
-        search_items = extract_tour_api_items(
-            search_data,
-            place_name,
-            "검색"
-        )
-
-        if not search_items:
-            tour_description_cache[place_name] = ""
-            return ""
-
-        first_item = search_items[0]
-        content_id = first_item.get("contentid")
-        content_type_id = first_item.get("contenttypeid")
+        content_id, content_type_id, matched_title = search_tour_content(place_name)
 
         if not content_id:
-            print("TourAPI contentId 없음:", place_name)
+            print("TourAPI 최종 검색 결과 없음:", place_name)
             tour_description_cache[place_name] = ""
             return ""
 
@@ -465,7 +492,7 @@ def get_tour_description(place_name):
             timeout=5
         )
 
-        print("TourAPI 상세 조회:", place_name, detail_res.status_code)
+        print("TourAPI 상세 조회:", place_name, "=>", matched_title, detail_res.status_code)
 
         if detail_res.status_code != 200:
             print("TourAPI 상세 조회 실패:", detail_res.text[:300])
@@ -494,9 +521,9 @@ def get_tour_description(place_name):
         description = clean_html(overview)
 
         if description:
-            print("TourAPI 설명 조회 성공:", place_name)
+            print("TourAPI 설명 조회 성공:", place_name, "=>", matched_title)
         else:
-            print("TourAPI overview 없음:", place_name)
+            print("TourAPI overview 없음:", place_name, "=>", matched_title)
 
         tour_description_cache[place_name] = description
         return description
