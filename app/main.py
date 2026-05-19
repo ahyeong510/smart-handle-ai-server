@@ -348,24 +348,41 @@ def normalize_tour_api_items(items, place_name, label):
 
 
 def extract_tour_api_items(data, place_name, label):
-    response = data.get("response", {})
-    body = response.get("body", {})
-    items = body.get("items", {})
+    try:
+        response = data.get("response", {})
+        body = response.get("body", {})
+        items = body.get("items", {})
 
-    if not items:
-        print(f"TourAPI {label} items 없음:", place_name)
+        if not items:
+            print(f"TourAPI {label} items 없음:", place_name)
+            return []
+
+        if isinstance(items, str):
+            print(f"TourAPI {label} items 문자열:", place_name, items[:100])
+            return []
+
+        if not isinstance(items, dict):
+            print(f"TourAPI {label} items 형식 이상:", place_name, type(items))
+            return []
+
+        item = items.get("item")
+
+        if not item:
+            print(f"TourAPI {label} item 없음:", place_name)
+            return []
+
+        if isinstance(item, dict):
+            return [item]
+
+        if isinstance(item, list):
+            return [x for x in item if isinstance(x, dict)]
+
+        print(f"TourAPI {label} item 형식 이상:", place_name, type(item))
         return []
 
-    if isinstance(items, str):
-        print(f"TourAPI {label} items 문자열:", place_name, items[:100])
+    except Exception as e:
+        print(f"TourAPI {label} 파싱 오류:", place_name, e)
         return []
-
-    if not isinstance(items, dict):
-        print(f"TourAPI {label} items 형식 이상:", place_name, type(items))
-        return []
-
-    raw_items = items.get("item", [])
-    return normalize_tour_api_items(raw_items, place_name, label)
 
 
 def make_tour_search_keywords(place_name):
@@ -508,6 +525,7 @@ def get_tour_description(place_name):
             "MobileApp": "SmartHandle",
             "_type": "json",
             "contentId": content_id,
+            "contentTypeId": content_type_id,
             "defaultYN": "Y",
             "firstImageYN": "Y",
             "areacodeYN": "Y",
