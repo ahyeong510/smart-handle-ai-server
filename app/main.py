@@ -118,11 +118,13 @@ def get_user_preference_from_history(rides: List[dict]):
         return get_default_user_weights()
 
     scored_rides = []
+
     for ride in rides:
         feedback = compute_feedback_score(
             ride.get("completionPercent", 0),
             ride.get("satisfaction", "")
         )
+
         scored_rides.append({
             "feedback": feedback,
             "elevation": ride.get("elevationGain", 0),
@@ -144,6 +146,7 @@ def get_user_preference_from_history(rides: List[dict]):
     dur_pref = 1.0 / (avg_dur + 1)
 
     total = elev_pref + turn_pref + dur_pref
+
     if total == 0:
         return get_default_user_weights()
 
@@ -395,9 +398,6 @@ def make_tour_search_keywords(place_name):
 def search_tour_content(place_name):
     keywords = make_tour_search_keywords(place_name)
 
-    # TourAPI contenttypeid
-    # 12: 관광지, 14: 문화시설, 15: 축제/공연/행사, 25: 여행코스, 28: 레포츠
-    # 32: 숙박, 39: 음식점은 제외
     allowed_content_types = {"12", "14", "15", "25", "28"}
 
     for keyword in keywords:
@@ -508,8 +508,12 @@ def get_tour_description(place_name):
             "MobileApp": "SmartHandle",
             "_type": "json",
             "contentId": content_id,
-            "contentTypeId": content_type_id,
             "defaultYN": "Y",
+            "firstImageYN": "Y",
+            "areacodeYN": "Y",
+            "catcodeYN": "Y",
+            "addrinfoYN": "Y",
+            "mapinfoYN": "Y",
             "overviewYN": "Y"
         }
 
@@ -559,6 +563,24 @@ def get_tour_description(place_name):
         print("TourAPI 설명 조회 오류:", place_name, e)
         tour_description_cache[place_name] = ""
         return ""
+
+
+def attach_descriptions_and_filter(places):
+    result = []
+
+    for p in places:
+        place_name = p.get("place_name", "관광지")
+        description = get_tour_description(place_name)
+
+        if description:
+            p["tour_description"] = description
+            result.append(p)
+            print("설명 있는 관광지 유지:", place_name)
+        else:
+            print("설명 없는 관광지 제외:", place_name)
+
+    print("설명 있는 관광지 개수:", len(result))
+    return result
 
 
 # ------------------ 카카오 경로 ------------------
@@ -618,6 +640,7 @@ def get_route_with_waypoints(start, tour_places):
     waypoint_places = tour_places[:-1]
 
     waypoints = []
+
     for place in waypoint_places:
         lat = float(place["y"])
         lng = float(place["x"])
@@ -663,6 +686,7 @@ def make_tour_place_groups(places, group_size=3, group_count=6):
         group = random.sample(places, group_size)
 
         key = tuple(sorted([p.get("id", p.get("place_name", "")) for p in group]))
+
         if key in used_keys:
             continue
 
@@ -735,6 +759,7 @@ def get_elevations(points):
 
         data = res.json()
         return [x["elevation"] for x in data.get("results", [])]
+
     except Exception:
         return []
 
@@ -745,6 +770,7 @@ def analyze_route(points, elevations):
 
     for i in range(len(points) - 1):
         d = haversine(points[i], points[i + 1])
+
         if d == 0:
             continue
 
@@ -768,12 +794,14 @@ def calculate_bearing(p1, p2):
     dlon = lon2 - lon1
 
     y = math.sin(dlon) * math.cos(lat2)
+
     x = (
         math.cos(lat1) * math.sin(lat2)
         - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
     )
 
     bearing = math.degrees(math.atan2(y, x))
+
     return (bearing + 360) % 360
 
 
@@ -782,11 +810,13 @@ def calculate_turn_count(points, threshold_deg=35):
         return 0
 
     count = 0
+
     for i in range(1, len(points) - 1):
         b1 = calculate_bearing(points[i - 1], points[i])
         b2 = calculate_bearing(points[i], points[i + 1])
 
         diff = abs(b2 - b1)
+
         if diff > 180:
             diff = 360 - diff
 
@@ -908,7 +938,7 @@ def build_tour_course_candidate(route_json, tour_places, idx):
     for p in tour_places:
         place_name = p.get("place_name", "관광지")
         address = p.get("road_address_name") or p.get("address_name", "")
-        description = get_tour_description(place_name) or ""
+        description = p.get("tour_description", "")
 
         candidate["tour_places"].append({
             "name": place_name,
@@ -950,6 +980,7 @@ def apply_scores(candidates, user_weights):
         c["score"] = round(final_score, 2)
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
+
     return candidates
 
 
@@ -980,6 +1011,7 @@ def apply_tour_scores(candidates):
         c["score"] = round(final_score, 2)
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
+
     return candidates
 
 
@@ -1001,12 +1033,15 @@ def recommend_loop(req: FitnessRecommendRequest):
     )
 
     candidates = []
+
     for dest in destinations:
         route_json = get_route(start, dest)
+
         if not route_json:
             continue
 
         c = build_candidate(route_json, len(candidates) + 1)
+
         if c:
             candidates.append(c)
 
@@ -1041,11 +1076,28 @@ def recommend_tour_routes(req: TourRecommendRequest):
 
     print("검색된 관광지 개수:", len(places))
 
+    places = attach_descriptions_and_filter(places)
+
+    if len(places) < 3 and radius_m < 10000:
+        print("설명 있는 관광지 부족 → 10km 재검색")
+
+        places = search_tour_places(
+            lat=req.start_lat,
+            lng=req.start_lng,
+            radius_m=10000
+        )
+
+        places = attach_descriptions_and_filter(places)
+
+    print("설명 필터 후 관광지 개수:", len(places))
+
     if len(places) < 3:
-        print("관광지 3개 미만이라 코스 생성 불가")
+        print("설명 있는 관광지 3개 미만이라 코스 생성 불가")
+
         return {
             "routes": [],
-            "count": 0
+            "count": 0,
+            "message": "설명 정보가 있는 관광지가 부족합니다. 반경을 넓히거나 다른 위치에서 다시 시도해주세요."
         }
 
     place_groups = make_tour_place_groups(
