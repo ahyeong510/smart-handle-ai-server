@@ -1,6 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import requests
 import math
 import os
@@ -31,6 +31,7 @@ MAX_CANDIDATES = 3
 ELEV_SAMPLE_POINTS = 10
 
 tour_description_cache = {}
+tour_detail_cache = {}
 
 
 class RideHistoryItem(BaseModel):
@@ -671,48 +672,55 @@ def get_fallback_tour_description(place_name):
 
     return ""
 
-def get_tour_description(place_name):
-    if not place_name:
-        return ""
+def get_empty_tour_detail(place_name=""):
+    return {
+        "content_id": "",
+        "content_type_id": "",
+        "tour_title": place_name or "",
+        "addr1": "",
+        "overview": ""
+    }
 
-    if place_name in tour_description_cache:
-        return tour_description_cache[place_name]
+
+def get_tour_detail(place_name):
+    """
+    Kakao Local에서 받은 관광지명으로 TourAPI searchKeyword2를 호출해 contentId를 찾고,
+    detailCommon2로 title / addr1 / overview를 가져온다.
+    """
+    if not place_name:
+        return get_empty_tour_detail()
+
+    if place_name in tour_detail_cache:
+        return tour_detail_cache[place_name]
+
+    result = get_empty_tour_detail(place_name)
 
     if not TOUR_API_KEY:
         print("TOUR_API_KEY 없음")
-        fallback_description = get_fallback_tour_description(place_name)
-        tour_description_cache[place_name] = fallback_description
-        return fallback_description
+        result["overview"] = get_fallback_tour_description(place_name)
+        tour_detail_cache[place_name] = result
+        return result
 
     try:
         content_id, content_type_id, matched_title = search_tour_content(place_name)
 
         if not content_id:
             print("TourAPI 최종 검색 결과 없음:", place_name)
+            result["overview"] = get_fallback_tour_description(place_name)
+            tour_detail_cache[place_name] = result
+            return result
 
-            fallback_description = get_fallback_tour_description(place_name)
-            if fallback_description:
-                print("Fallback 설명 사용:", place_name)
-                tour_description_cache[place_name] = fallback_description
-                return fallback_description
-
-            tour_description_cache[place_name] = ""
-            return ""
-
+        # KorService2 detailCommon2는 예전 detailCommon1 옵션
+        # (defaultYN, addrinfoYN, overviewYN, contentTypeId 등)을 보내면
+        # INVALID_REQUEST_PARAMETER_ERROR가 날 수 있어서 contentId 중심으로만 요청한다.
         detail_params = {
             "serviceKey": TOUR_API_KEY,
             "MobileOS": "ETC",
             "MobileApp": "SmartHandle",
             "_type": "json",
-            "contentId": content_id,
-            "contentTypeId": content_type_id,
-            "defaultYN": "Y",
-            "firstImageYN": "Y",
-            "areacodeYN": "Y",
-            "catcodeYN": "Y",
-            "addrinfoYN": "Y",
-            "mapinfoYN": "Y",
-            "overviewYN": "Y"
+            "numOfRows": 10,
+            "pageNo": 1,
+            "contentId": content_id
         }
 
         detail_res = requests.get(
@@ -725,30 +733,24 @@ def get_tour_description(place_name):
 
         if detail_res.status_code != 200:
             print("TourAPI 상세 조회 실패:", detail_res.text[:300])
-
-            fallback_description = get_fallback_tour_description(place_name)
-            if fallback_description:
-                print("Fallback 설명 사용:", place_name)
-                tour_description_cache[place_name] = fallback_description
-                return fallback_description
-
-            tour_description_cache[place_name] = ""
-            return ""
+            result["content_id"] = str(content_id or "")
+            result["content_type_id"] = str(content_type_id or "")
+            result["tour_title"] = matched_title or place_name
+            result["overview"] = get_fallback_tour_description(place_name)
+            tour_detail_cache[place_name] = result
+            return result
 
         try:
             detail_data = detail_res.json()
         except Exception as e:
             print("TourAPI 상세 조회 JSON 파싱 실패:", place_name, e)
             print("응답 일부:", detail_res.text[:300])
-
-            fallback_description = get_fallback_tour_description(place_name)
-            if fallback_description:
-                print("Fallback 설명 사용:", place_name)
-                tour_description_cache[place_name] = fallback_description
-                return fallback_description
-
-            tour_description_cache[place_name] = ""
-            return ""
+            result["content_id"] = str(content_id or "")
+            result["content_type_id"] = str(content_type_id or "")
+            result["tour_title"] = matched_title or place_name
+            result["overview"] = get_fallback_tour_description(place_name)
+            tour_detail_cache[place_name] = result
+            return result
 
         detail_items = extract_tour_api_items(
             detail_data,
@@ -757,43 +759,41 @@ def get_tour_description(place_name):
         )
 
         if not detail_items:
-            fallback_description = get_fallback_tour_description(place_name)
+            result["content_id"] = str(content_id or "")
+            result["content_type_id"] = str(content_type_id or "")
+            result["tour_title"] = matched_title or place_name
+            result["overview"] = get_fallback_tour_description(place_name)
+            tour_detail_cache[place_name] = result
+            return result
 
-            if fallback_description:
-                print("Fallback 설명 사용:", place_name)
-                tour_description_cache[place_name] = fallback_description
-                return fallback_description
+        item = detail_items[0]
+        overview = clean_html(item.get("overview", ""))
 
-            tour_description_cache[place_name] = ""
-            return ""
+        if not overview:
+            overview = get_fallback_tour_description(place_name)
 
-        overview = detail_items[0].get("overview", "")
-        description = clean_html(overview)
+        result = {
+            "content_id": str(item.get("contentid") or content_id or ""),
+            "content_type_id": str(item.get("contenttypeid") or content_type_id or ""),
+            "tour_title": clean_html(item.get("title") or matched_title or place_name),
+            "addr1": clean_html(item.get("addr1") or ""),
+            "overview": overview
+        }
 
-        if description:
-            print("TourAPI 설명 조회 성공:", place_name, "=>", matched_title)
-        else:
-            print("TourAPI overview 없음:", place_name, "=>", matched_title)
-
-            fallback_description = get_fallback_tour_description(place_name)
-            if fallback_description:
-                print("Fallback 설명 사용:", place_name)
-                description = fallback_description
-
-        tour_description_cache[place_name] = description
-        return description
+        print("TourAPI 상세 정보 성공:", place_name, "=>", result["tour_title"])
+        tour_detail_cache[place_name] = result
+        return result
 
     except Exception as e:
-        print("TourAPI 설명 조회 오류:", place_name, e)
+        print("TourAPI 상세 정보 조회 오류:", place_name, e)
+        result["overview"] = get_fallback_tour_description(place_name)
+        tour_detail_cache[place_name] = result
+        return result
 
-        fallback_description = get_fallback_tour_description(place_name)
-        if fallback_description:
-            print("Fallback 설명 사용:", place_name)
-            tour_description_cache[place_name] = fallback_description
-            return fallback_description
 
-        tour_description_cache[place_name] = ""
-        return ""
+def get_tour_description(place_name):
+    detail = get_tour_detail(place_name)
+    return detail.get("overview", "")
 
 # ------------------ 카카오 경로 ------------------
 
@@ -1142,13 +1142,22 @@ def build_tour_course_candidate(route_json, tour_places, idx):
     for p in tour_places:
         place_name = p.get("place_name", "관광지")
         address = p.get("road_address_name") or p.get("address_name", "")
-        description = get_tour_description(place_name) or ""
+        tour_detail = get_tour_detail(place_name)
+        description = tour_detail.get("overview", "") or ""
 
         candidate["tour_places"].append({
             "name": place_name,
             "lat": float(p["y"]),
             "lng": float(p["x"]),
             "address": address,
+
+            # TourAPI 정보
+            "content_id": tour_detail.get("content_id", ""),
+            "content_type_id": tour_detail.get("content_type_id", ""),
+            "tour_title": tour_detail.get("tour_title", ""),
+            "addr1": tour_detail.get("addr1", ""),
+
+            # Android TTS에서 읽을 설명
             "description": description
         })
 
@@ -1300,6 +1309,183 @@ def apply_tour_scores(candidates):
 @app.get("/")
 def root():
     return {"message": "SMART HANDLE AI SERVER RUNNING"}
+
+
+@app.get("/tour/info")
+def get_tour_info(
+    content_id: str = Query(..., description="TourAPI contentId"),
+    content_type_id: Optional[str] = Query(None, description="TourAPI contentTypeId")
+):
+    """
+    테스트용 API.
+    contentId를 직접 넣어서 detailCommon2 연결이 되는지 확인한다.
+    최종 앱에서는 /tour/recommend 응답에 설명까지 포함해서 내려준다.
+    """
+    if not TOUR_API_KEY:
+        return {
+            "success": False,
+            "message": "TOUR_API_KEY 없음",
+            "contentId": content_id,
+            "contentTypeId": content_type_id or "",
+            "title": "",
+            "addr1": "",
+            "overview": ""
+        }
+
+    try:
+        # KorService2 detailCommon2는 예전 detailCommon1 옵션
+        # (defaultYN, addrinfoYN, overviewYN, contentTypeId 등)을 보내면
+        # INVALID_REQUEST_PARAMETER_ERROR가 날 수 있어서 contentId 중심으로만 요청한다.
+        params = {
+            "serviceKey": TOUR_API_KEY,
+            "MobileOS": "ETC",
+            "MobileApp": "SmartHandle",
+            "_type": "json",
+            "numOfRows": 10,
+            "pageNo": 1,
+            "contentId": content_id
+        }
+
+        res = requests.get(
+            TOUR_API_DETAIL_COMMON_URL,
+            params=params,
+            timeout=5
+        )
+
+        print("/tour/info 상태코드:", res.status_code)
+        print("/tour/info 응답 전체:", res.text[:2000])
+
+        if res.status_code != 200:
+            return {
+                "success": False,
+                "message": "TourAPI 호출 실패",
+                "status_code": res.status_code,
+                "raw": res.text[:2000],
+                "contentId": content_id,
+                "contentTypeId": content_type_id or "",
+                "title": "",
+                "addr1": "",
+                "overview": ""
+            }
+
+        data = res.json()
+
+        items = extract_tour_api_items(
+            data,
+            content_id,
+            "tour/info"
+        )
+
+        if not items:
+            return {
+                "success": False,
+                "message": "TourAPI 결과 없음",
+                "contentId": content_id,
+                "contentTypeId": content_type_id or "",
+                "title": "",
+                "addr1": "",
+                "overview": ""
+            }
+
+        item = items[0]
+
+        return {
+            "success": True,
+            "contentId": str(item.get("contentid") or content_id),
+            "contentTypeId": str(item.get("contenttypeid") or content_type_id or ""),
+            "title": clean_html(item.get("title", "")),
+            "addr1": clean_html(item.get("addr1", "")),
+            "overview": clean_html(item.get("overview", ""))
+        }
+
+    except Exception as e:
+        print("/tour/info 오류:", e)
+        return {
+            "success": False,
+            "message": str(e),
+            "contentId": content_id,
+            "contentTypeId": content_type_id or "",
+            "title": "",
+            "addr1": "",
+            "overview": ""
+        }
+
+@app.get("/tour/search-test")
+def tour_search_test(keyword: str = Query(..., description="검색할 관광지명")):
+    """
+    TourAPI searchKeyword2 테스트용.
+    관광지명으로 contentId가 잡히는지 확인한다.
+    """
+    if not TOUR_API_KEY:
+        return {
+            "success": False,
+            "message": "TOUR_API_KEY 없음",
+            "items": []
+        }
+
+    try:
+        params = {
+            "serviceKey": TOUR_API_KEY,
+            "MobileOS": "ETC",
+            "MobileApp": "SmartHandle",
+            "_type": "json",
+            "numOfRows": 10,
+            "pageNo": 1,
+            "keyword": keyword
+        }
+
+        res = requests.get(
+            TOUR_API_SEARCH_KEYWORD_URL,
+            params=params,
+            timeout=5
+        )
+
+        print("/tour/search-test 상태코드:", res.status_code)
+        print("/tour/search-test 응답:", res.text[:500])
+
+        if res.status_code != 200:
+            return {
+                "success": False,
+                "message": "TourAPI 검색 호출 실패",
+                "status_code": res.status_code,
+                "raw": res.text[:500],
+                "items": []
+            }
+
+        data = res.json()
+
+        items = extract_tour_api_items(
+            data,
+            keyword,
+            "tour/search-test"
+        )
+
+        result_items = []
+
+        for item in items:
+            result_items.append({
+                "contentId": str(item.get("contentid", "")),
+                "contentTypeId": str(item.get("contenttypeid", "")),
+                "title": clean_html(item.get("title", "")),
+                "addr1": clean_html(item.get("addr1", "")),
+                "mapx": item.get("mapx", ""),
+                "mapy": item.get("mapy", "")
+            })
+
+        return {
+            "success": True,
+            "keyword": keyword,
+            "count": len(result_items),
+            "items": result_items
+        }
+
+    except Exception as e:
+        print("/tour/search-test 오류:", e)
+        return {
+            "success": False,
+            "message": str(e),
+            "items": []
+        }
 
 
 @app.post("/fitness/recommend-loop")
