@@ -186,6 +186,82 @@ def compute_feedback_score(completion_percent: int, satisfaction: str) -> float:
     satisfaction_score = satisfaction_to_score(satisfaction)
     return 0.6 * completion_score + 0.4 * satisfaction_score
 
+def make_label(completion_percent: int, satisfaction: str) -> int:
+    feedback = compute_feedback_score(completion_percent, satisfaction)
+
+    if feedback >= 0.7:
+        return 1
+    return 0
+
+
+def build_ml_dataset(rides):
+    X = []
+    y = []
+
+    for ride in rides:
+        distance = float(ride.get("distanceKm", 0.0))
+        elevation = float(ride.get("elevationGain", 0))
+        turn = float(ride.get("turnCount", 0))
+        duration = float(ride.get("durationMin", 0))
+
+        completion = int(ride.get("completionPercent", 0))
+        satisfaction = ride.get("satisfaction", "보통")
+
+        X.append([
+            distance,
+            elevation,
+            turn,
+            duration
+        ])
+
+        y.append(make_label(completion, satisfaction))
+
+    return X, y
+
+
+def predict_ml_scores(candidates, rides):
+    if len(rides) < 5:
+        print("ML 미사용: 기록 5개 미만")
+        return None
+
+    X, y = build_ml_dataset(rides)
+
+    if len(set(y)) < 2:
+        print("ML 미사용: 만족/불만족 데이터 부족")
+        return None
+
+    try:
+        scaler = StandardScaler()
+
+        X_scaled = scaler.fit_transform(np.array(X))
+
+        model = LogisticRegression()
+
+        model.fit(X_scaled, y)
+
+        candidate_X = []
+
+        for c in candidates:
+            candidate_X.append([
+                float(c.get("distance_km", 0.0)),
+                float(c.get("elevation_gain", 0)),
+                float(c.get("turn_count", 0)),
+                float(c.get("duration_min", 0))
+            ])
+
+        candidate_X_scaled = scaler.transform(
+            np.array(candidate_X)
+        )
+
+        probabilities = model.predict_proba(
+            candidate_X_scaled
+        )[:, 1]
+
+        return probabilities.tolist()
+
+    except Exception as e:
+        print("Logistic Regression 오류:", e)
+        return None
 
 def get_user_preference_from_history(rides: List[dict]):
     """
@@ -1161,14 +1237,13 @@ def recommend_loop(req: FitnessRecommendRequest):
     rides = [item.dict() for item in req.ride_history]
     user_pattern = get_user_preference_from_history(rides)
 
-candidates = apply_scores(candidates, user_pattern, rides)
+    candidates = apply_scores(candidates, user_pattern, rides)
 
     return {
         "routes": candidates,
         "count": len(candidates),
         "user_pattern": user_pattern
     }
-
 
 @app.post("/tour/recommend")
 def recommend_tour_routes(req: TourRecommendRequest):
