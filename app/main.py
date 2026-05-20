@@ -491,25 +491,41 @@ def normalize_tour_api_items(items, place_name, label):
 
 
 def extract_tour_api_items(data, place_name, label):
-    response = data.get("response", {})
-    body = response.get("body", {})
-    items = body.get("items", {})
+    try:
+        response = data.get("response", {})
+        body = response.get("body", {})
+        items = body.get("items", {})
 
-    if not items:
-        print(f"TourAPI {label} items 없음:", place_name)
+        if not items:
+            print(f"TourAPI {label} items 없음:", place_name)
+            return []
+
+        if isinstance(items, str):
+            print(f"TourAPI {label} items 문자열:", place_name, items[:100])
+            return []
+
+        if not isinstance(items, dict):
+            print(f"TourAPI {label} items 형식 이상:", place_name, type(items))
+            return []
+
+        item = items.get("item")
+
+        if not item:
+            print(f"TourAPI {label} item 없음:", place_name)
+            return []
+
+        if isinstance(item, dict):
+            return [item]
+
+        if isinstance(item, list):
+            return [x for x in item if isinstance(x, dict)]
+
+        print(f"TourAPI {label} item 형식 이상:", place_name, type(item))
         return []
 
-    if isinstance(items, str):
-        print(f"TourAPI {label} items 문자열:", place_name, items[:100])
+    except Exception as e:
+        print(f"TourAPI {label} 파싱 오류:", place_name, e)
         return []
-
-    if not isinstance(items, dict):
-        print(f"TourAPI {label} items 형식 이상:", place_name, type(items))
-        return []
-
-    raw_items = items.get("item", [])
-    return normalize_tour_api_items(raw_items, place_name, label)
-
 
 def make_tour_search_keywords(place_name):
     keywords = [place_name]
@@ -624,6 +640,36 @@ def search_tour_content(place_name):
 
     return None, None, ""
 
+def get_fallback_tour_description(place_name):
+    if (
+        "광교저수지" in place_name
+        or "청송못" in place_name
+        or "광교호수공원" in place_name
+    ):
+        return (
+            "광교호수공원은 수원시와 용인시에 걸쳐 있는 대형 호수공원입니다. "
+            "넓은 산책로와 자전거길, 수변 경관이 조성되어 있어 시민들이 휴식과 운동을 즐기기 좋은 장소입니다."
+        )
+
+    if (
+        "수원팔색길" in place_name
+        or "화성성곽길" in place_name
+        or "여우길" in place_name
+        or "모수길" in place_name
+        or "효행길" in place_name
+    ):
+        return (
+            "수원팔색길은 수원의 자연, 역사, 문화 공간을 연결한 도보 여행길입니다. "
+            "코스마다 하천, 마을길, 공원, 수원화성 주변을 지나며 수원의 다양한 풍경을 느낄 수 있습니다."
+        )
+
+    if "수원화성" in place_name or "화성행궁" in place_name:
+        return (
+            "수원화성은 조선 정조 때 축조된 성곽으로, 군사적 기능과 도시 계획이 결합된 대표적인 문화유산입니다. "
+            "화성행궁과 성곽길 주변은 수원의 역사와 문화를 체험할 수 있는 관광지입니다."
+        )
+
+    return ""
 
 def get_tour_description(place_name):
     if not place_name:
@@ -634,14 +680,22 @@ def get_tour_description(place_name):
 
     if not TOUR_API_KEY:
         print("TOUR_API_KEY 없음")
-        tour_description_cache[place_name] = ""
-        return ""
+        fallback_description = get_fallback_tour_description(place_name)
+        tour_description_cache[place_name] = fallback_description
+        return fallback_description
 
     try:
         content_id, content_type_id, matched_title = search_tour_content(place_name)
 
         if not content_id:
             print("TourAPI 최종 검색 결과 없음:", place_name)
+
+            fallback_description = get_fallback_tour_description(place_name)
+            if fallback_description:
+                print("Fallback 설명 사용:", place_name)
+                tour_description_cache[place_name] = fallback_description
+                return fallback_description
+
             tour_description_cache[place_name] = ""
             return ""
 
@@ -653,6 +707,11 @@ def get_tour_description(place_name):
             "contentId": content_id,
             "contentTypeId": content_type_id,
             "defaultYN": "Y",
+            "firstImageYN": "Y",
+            "areacodeYN": "Y",
+            "catcodeYN": "Y",
+            "addrinfoYN": "Y",
+            "mapinfoYN": "Y",
             "overviewYN": "Y"
         }
 
@@ -666,6 +725,13 @@ def get_tour_description(place_name):
 
         if detail_res.status_code != 200:
             print("TourAPI 상세 조회 실패:", detail_res.text[:300])
+
+            fallback_description = get_fallback_tour_description(place_name)
+            if fallback_description:
+                print("Fallback 설명 사용:", place_name)
+                tour_description_cache[place_name] = fallback_description
+                return fallback_description
+
             tour_description_cache[place_name] = ""
             return ""
 
@@ -674,6 +740,13 @@ def get_tour_description(place_name):
         except Exception as e:
             print("TourAPI 상세 조회 JSON 파싱 실패:", place_name, e)
             print("응답 일부:", detail_res.text[:300])
+
+            fallback_description = get_fallback_tour_description(place_name)
+            if fallback_description:
+                print("Fallback 설명 사용:", place_name)
+                tour_description_cache[place_name] = fallback_description
+                return fallback_description
+
             tour_description_cache[place_name] = ""
             return ""
 
@@ -684,6 +757,13 @@ def get_tour_description(place_name):
         )
 
         if not detail_items:
+            fallback_description = get_fallback_tour_description(place_name)
+
+            if fallback_description:
+                print("Fallback 설명 사용:", place_name)
+                tour_description_cache[place_name] = fallback_description
+                return fallback_description
+
             tour_description_cache[place_name] = ""
             return ""
 
@@ -695,14 +775,25 @@ def get_tour_description(place_name):
         else:
             print("TourAPI overview 없음:", place_name, "=>", matched_title)
 
+            fallback_description = get_fallback_tour_description(place_name)
+            if fallback_description:
+                print("Fallback 설명 사용:", place_name)
+                description = fallback_description
+
         tour_description_cache[place_name] = description
         return description
 
     except Exception as e:
         print("TourAPI 설명 조회 오류:", place_name, e)
+
+        fallback_description = get_fallback_tour_description(place_name)
+        if fallback_description:
+            print("Fallback 설명 사용:", place_name)
+            tour_description_cache[place_name] = fallback_description
+            return fallback_description
+
         tour_description_cache[place_name] = ""
         return ""
-
 
 # ------------------ 카카오 경로 ------------------
 
