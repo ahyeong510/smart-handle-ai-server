@@ -6,6 +6,9 @@ import math
 import os
 import random
 import re
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,12 +34,12 @@ tour_description_cache = {}
 
 
 class RideHistoryItem(BaseModel):
+    distanceKm: float = 0.0
     elevationGain: int
     turnCount: int
     durationMin: int
     completionPercent: int
     satisfaction: str
-
 
 class FitnessRecommendRequest(BaseModel):
     user_id: str
@@ -100,6 +103,85 @@ def satisfaction_to_score(satisfaction: str) -> float:
 
 
 def compute_feedback_score(completion_percent: int, satisfaction: str) -> float:
+    def make_label(completion_percent: int, satisfaction: str) -> int:
+        """
+        만족 여부를 0/1로 변환
+        1 = 사용자가 좋아한 주행
+        0 = 사용자가 별로라고 판단한 주행
+        """
+        feedback = compute_feedback_score(completion_percent, satisfaction)
+
+        if feedback >= 0.7:
+            return 1
+        return 0
+
+
+    def build_ml_dataset(rides: List[dict]):
+        X = []
+        y = []
+
+        for ride in rides:
+            distance = float(ride.get("distanceKm", 0.0))
+            elevation = float(ride.get("elevationGain", 0))
+            turn = float(ride.get("turnCount", 0))
+            duration = float(ride.get("durationMin", 0))
+
+            completion = int(ride.get("completionPercent", 0))
+            satisfaction = ride.get("satisfaction", "보통")
+
+            X.append([
+                distance,
+                elevation,
+                turn,
+                duration
+            ])
+
+            y.append(make_label(completion, satisfaction))
+
+        return X, y
+
+
+    def predict_ml_scores(candidates, rides: List[dict]):
+        """
+        후보 경로마다 사용자가 만족할 확률을 계산함.
+        데이터가 부족하면 None 반환.
+        """
+        if len(rides) < 5:
+            print("ML 미사용: 기록 5개 미만")
+            return None
+
+        X, y = build_ml_dataset(rides)
+
+        if len(set(y)) < 2:
+            print("ML 미사용: 만족/불만족 데이터가 한쪽만 있음")
+            return None
+
+        try:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(np.array(X))
+
+            model = LogisticRegression()
+            model.fit(X_scaled, y)
+
+            candidate_X = []
+
+            for c in candidates:
+                candidate_X.append([
+                    float(c.get("distance_km", 0.0)),
+                    float(c.get("elevation_gain", 0)),
+                    float(c.get("turn_count", 0)),
+                    float(c.get("duration_min", 0))
+                ])
+
+            candidate_X_scaled = scaler.transform(np.array(candidate_X))
+
+            probabilities = model.predict_proba(candidate_X_scaled)[:, 1]
+
+            return probabilities.tolist()
+
+        except Exception as e:
+            print("Logistic Regression 오류:", e)
+            return None
     completion_score = clamp(completion_percent / 100.0)
     satisfaction_score = satisfaction_to_score(satisfaction)
     return 0.6 * completion_score + 0.4 * satisfaction_score
@@ -920,33 +1002,74 @@ def similarity_score(value, target):
     return clamp(1.0 - diff_ratio)
 
 
-def apply_scores(candidates, user_pattern):
+def apply_scores(candidates, user_pattern, rides=None):
     if not candidates:
         return candidates
 
-    # 기록이 없거나 좋은 기록이 없으면 기존처럼 무난한 쉬운 코스 기준으로 추천
-    if not user_pattern:
-        min_elev = min(c["elevation_gain"] for c in candidates)
-        max_elev = max(c["elevation_gain"] for c in candidates)
+    if rides is None:
+        rides = []
 
-        min_turn = min(c["turn_count"] for c in candidates)
-        max_turn = max(c["turn_count"] for c in candidates)
+    min_elev = min(c["elevation_gain"] for c in candidates)
+    max_elev = max(c["elevation_gain"] for c in candidates)
 
-        min_dur = min(c["duration_min"] for c in candidates)
-        max_dur = max(c["duration_min"] for c in candidates)
+    min_turn = min(c["turn_count"] for c in candidates)
+    max_turn = max(c["turn_count"] for c in candidates)
 
-        for c in candidates:
-            elev_score = normalize_low_better(c["elevation_gain"], min_elev, max_elev)
-            turn_score = normalize_low_better(c["turn_count"], min_turn, max_turn)
-            dur_score = normalize_low_better(c["duration_min"], min_dur, max_dur)
+    min_dur = min(c["duration_min"] for c in candidates)
+    max_dur = max(c["duration_min"] for c in candidates)
 
-            c["score"] = round(
-                0.4 * elev_score + 0.3 * turn_score + 0.3 * dur_score,
-                2
+    rule_scores = []
+
+    for c in candidates:
+        elev_score = normalize_low_better(c["elevation_gain"], min_elev, max_elev)
+        turn_score = normalize_low_better(c["turn_count"], min_turn, max_turn)
+        dur_score = normalize_low_better(c["duration_min"], min_dur, max_dur)
+
+        # 기록이 없으면 기본 쉬운 코스 기준
+        if not user_pattern:
+            rule_score = (
+                0.4 * elev_score
+                + 0.3 * turn_score
+                + 0.3 * dur_score
+            )
+        else:
+            # 기존 user_pattern 기반 점수
+            rule_score = (
+                user_pattern["elevation"] * elev_score
+                + user_pattern["turn"] * turn_score
+                + user_pattern["duration"] * dur_score
             )
 
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        return candidates
+        rule_scores.append(rule_score)
+
+    ml_scores = predict_ml_scores(candidates, rides)
+
+    for i, c in enumerate(candidates):
+        rule_score = rule_scores[i]
+
+        if ml_scores is not None:
+            ml_score = ml_scores[i]
+
+            final_score = (
+                0.5 * rule_score
+                + 0.5 * ml_score
+            )
+
+            c["ml_score"] = round(ml_score, 2)
+            c["rule_score"] = round(rule_score, 2)
+            c["score_type"] = "logistic_regression"
+
+        else:
+            final_score = rule_score
+
+            c["ml_score"] = None
+            c["rule_score"] = round(rule_score, 2)
+            c["score_type"] = "rule_based"
+
+        c["score"] = round(final_score, 2)
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates
 
     # 기록이 있으면 사용자가 만족했던 운동 패턴과의 유사도로 추천
     for c in candidates:
@@ -1038,7 +1161,7 @@ def recommend_loop(req: FitnessRecommendRequest):
     rides = [item.dict() for item in req.ride_history]
     user_pattern = get_user_preference_from_history(rides)
 
-    candidates = apply_scores(candidates, user_pattern)
+candidates = apply_scores(candidates, user_pattern, rides)
 
     return {
         "routes": candidates,
