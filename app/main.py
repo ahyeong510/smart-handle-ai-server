@@ -87,14 +87,6 @@ def clamp(value, min_value=0.0, max_value=1.0):
     return max(min_value, min(max_value, value))
 
 
-def get_default_user_weights():
-    return {
-        "elevation": 0.4,
-        "turn": 0.3,
-        "duration": 0.3
-    }
-
-
 # ------------------ 사용자 맞춤 추천 ------------------
 
 def satisfaction_to_score(satisfaction: str) -> float:
@@ -114,15 +106,21 @@ def compute_feedback_score(completion_percent: int, satisfaction: str) -> float:
 
 
 def get_user_preference_from_history(rides: List[dict]):
+    """
+    사용자가 만족하고 완주율이 높았던 기록을 기반으로
+    평균 운동 패턴을 계산한다.
+    """
     if not rides:
-        return get_default_user_weights()
+        return None
 
     scored_rides = []
+
     for ride in rides:
         feedback = compute_feedback_score(
             ride.get("completionPercent", 0),
             ride.get("satisfaction", "")
         )
+
         scored_rides.append({
             "feedback": feedback,
             "elevation": ride.get("elevationGain", 0),
@@ -133,24 +131,14 @@ def get_user_preference_from_history(rides: List[dict]):
     good_rides = [r for r in scored_rides if r["feedback"] >= 0.7]
 
     if not good_rides:
-        good_rides = scored_rides
+        return None
 
-    avg_elev = sum(r["elevation"] for r in good_rides) / len(good_rides)
-    avg_turn = sum(r["turn"] for r in good_rides) / len(good_rides)
-    avg_dur = sum(r["duration"] for r in good_rides) / len(good_rides)
-
-    elev_pref = 1.0 / (avg_elev + 1)
-    turn_pref = 1.0 / (avg_turn + 1)
-    dur_pref = 1.0 / (avg_dur + 1)
-
-    total = elev_pref + turn_pref + dur_pref
-    if total == 0:
-        return get_default_user_weights()
+    total_feedback = sum(r["feedback"] for r in good_rides)
 
     return {
-        "elevation": elev_pref / total,
-        "turn": turn_pref / total,
-        "duration": dur_pref / total
+        "target_elevation": sum(r["elevation"] * r["feedback"] for r in good_rides) / total_feedback,
+        "target_turn": sum(r["turn"] * r["feedback"] for r in good_rides) / total_feedback,
+        "target_duration": sum(r["duration"] * r["feedback"] for r in good_rides) / total_feedback
     }
 
 
@@ -395,9 +383,6 @@ def make_tour_search_keywords(place_name):
 def search_tour_content(place_name):
     keywords = make_tour_search_keywords(place_name)
 
-    # TourAPI contenttypeid
-    # 12: 관광지, 14: 문화시설, 15: 축제/공연/행사, 25: 여행코스, 28: 레포츠
-    # 32: 숙박, 39: 음식점은 제외
     allowed_content_types = {"12", "14", "15", "25", "28"}
 
     for keyword in keywords:
@@ -923,28 +908,65 @@ def build_tour_course_candidate(route_json, tour_places, idx):
 
 # ------------------ 점수 계산 ------------------
 
-def apply_scores(candidates, user_weights):
+def similarity_score(value, target):
+    """
+    후보 경로 값이 사용자가 만족했던 평균 패턴과 가까울수록 높은 점수.
+    target과 완전히 같으면 1.0, 많이 다르면 0에 가까워진다.
+    """
+    if target <= 0:
+        return 1.0 if value <= 0 else 0.5
+
+    diff_ratio = abs(value - target) / target
+    return clamp(1.0 - diff_ratio)
+
+
+def apply_scores(candidates, user_pattern):
     if not candidates:
         return candidates
 
-    min_elev = min(c["elevation_gain"] for c in candidates)
-    max_elev = max(c["elevation_gain"] for c in candidates)
+    # 기록이 없거나 좋은 기록이 없으면 기존처럼 무난한 쉬운 코스 기준으로 추천
+    if not user_pattern:
+        min_elev = min(c["elevation_gain"] for c in candidates)
+        max_elev = max(c["elevation_gain"] for c in candidates)
 
-    min_turn = min(c["turn_count"] for c in candidates)
-    max_turn = max(c["turn_count"] for c in candidates)
+        min_turn = min(c["turn_count"] for c in candidates)
+        max_turn = max(c["turn_count"] for c in candidates)
 
-    min_dur = min(c["duration_min"] for c in candidates)
-    max_dur = max(c["duration_min"] for c in candidates)
+        min_dur = min(c["duration_min"] for c in candidates)
+        max_dur = max(c["duration_min"] for c in candidates)
 
+        for c in candidates:
+            elev_score = normalize_low_better(c["elevation_gain"], min_elev, max_elev)
+            turn_score = normalize_low_better(c["turn_count"], min_turn, max_turn)
+            dur_score = normalize_low_better(c["duration_min"], min_dur, max_dur)
+
+            c["score"] = round(
+                0.4 * elev_score + 0.3 * turn_score + 0.3 * dur_score,
+                2
+            )
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates
+
+    # 기록이 있으면 사용자가 만족했던 운동 패턴과의 유사도로 추천
     for c in candidates:
-        elev_score = normalize_low_better(c["elevation_gain"], min_elev, max_elev)
-        turn_score = normalize_low_better(c["turn_count"], min_turn, max_turn)
-        dur_score = normalize_low_better(c["duration_min"], min_dur, max_dur)
+        elev_score = similarity_score(
+            c["elevation_gain"],
+            user_pattern["target_elevation"]
+        )
+        turn_score = similarity_score(
+            c["turn_count"],
+            user_pattern["target_turn"]
+        )
+        dur_score = similarity_score(
+            c["duration_min"],
+            user_pattern["target_duration"]
+        )
 
         final_score = (
-            user_weights["elevation"] * elev_score
-            + user_weights["turn"] * turn_score
-            + user_weights["duration"] * dur_score
+            0.35 * elev_score
+            + 0.30 * turn_score
+            + 0.35 * dur_score
         )
 
         c["score"] = round(final_score, 2)
@@ -1014,14 +1036,14 @@ def recommend_loop(req: FitnessRecommendRequest):
             break
 
     rides = [item.dict() for item in req.ride_history]
-    user_weights = get_user_preference_from_history(rides)
+    user_pattern = get_user_preference_from_history(rides)
 
-    candidates = apply_scores(candidates, user_weights)
+    candidates = apply_scores(candidates, user_pattern)
 
     return {
         "routes": candidates,
         "count": len(candidates),
-        "user_weights": user_weights
+        "user_pattern": user_pattern
     }
 
 
