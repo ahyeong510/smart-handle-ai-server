@@ -1209,11 +1209,11 @@ def apply_scores(candidates, user_pattern, rides=None):
                 + 0.3 * dur_score
             )
         else:
-            # 기존 user_pattern 기반 점수
+            # user_pattern이 있어도 기본 규칙 점수 사용
             rule_score = (
-                user_pattern["elevation"] * elev_score
-                + user_pattern["turn"] * turn_score
-                + user_pattern["duration"] * dur_score
+                0.4 * elev_score
+                + 0.3 * turn_score
+                + 0.3 * dur_score
             )
 
         rule_scores.append(rule_score)
